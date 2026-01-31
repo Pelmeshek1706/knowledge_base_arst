@@ -1,20 +1,174 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
+import time
+from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List
+from zipfile import ZipFile, BadZipFile
+import xml.etree.ElementTree as ET
 
 from graphrag.config import Neo4jConfig
 from graphrag.storage.neo4j_client import Neo4jClient
 from graphrag.graph.graph_rag import GraphRag
-from graphrag.llm.lm_studio import LMStudioClient, LMStudioConfig, GraphRagQAAgent
-from graphrag.types.models import Chunk
+from graphrag.llm.lm_studio import LMStudioClient, LMStudioConfig, GraphRagQAAgent, ChunkSplitConfig
+from graphrag.types.models import Chunk, ChunkAnnotation, Entity
 
 DATA_JSON = os.environ.get("DATA_JSON", "/Users/pelmeshek1706/Desktop/projects/knowledge_agent/data/data.json")  # adjust for your machine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+TRACE_MAX_CHUNKS = 8
+TRACE_MAX_NODES = 25
+TRACE_MAX_EDGES = 25
+TRACE_MAX_ENTITIES = 20
+TRACE_MAX_TAGS = 30
+
+PROCESSED_DOCS_DIR = Path(os.environ.get("PROCESSED_DOCS_DIR", "processed_docs"))
+CACHE_FILE = PROCESSED_DOCS_DIR / "llm_annotations.json"
+
+
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_docx_text(path: Path) -> str:
+    try:
+        with ZipFile(path) as zf:
+            xml_bytes = zf.read("word/document.xml")
+    except (KeyError, BadZipFile) as exc:
+        raise RuntimeError(f"Invalid DOCX: {path}") from exc
+
+    root = ET.fromstring(xml_bytes)
+    paragraphs: List[str] = []
+    for p in root.findall(".//w:p", _DOCX_NS):
+        buf: List[str] = []
+        for node in p.iter():
+            tag = node.tag
+            if tag.endswith("}t") and node.text:
+                buf.append(node.text)
+            elif tag.endswith("}tab"):
+                buf.append("\t")
+            elif tag.endswith("}br") or tag.endswith("}cr"):
+                buf.append("\n")
+        line = "".join(buf).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n".join(paragraphs)
+
+
+def _read_rtf_text(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    # Very simple RTF cleanup; good enough for basic extraction.
+    text = re.sub(r"{\\\*?\\[^{}]+}", " ", raw)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", text)
+    text = re.sub(r"[{}]", " ", text)
+    return " ".join(text.split())
+
+
+def _read_document_text(path: Path) -> str:
+    if not path.exists():
+        logger.warning("File not found: %s", path)
+        return ""
+
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".docx":
+            return _read_docx_text(path)
+        if suffix == ".rtf":
+            return _read_rtf_text(path)
+        if suffix in {".txt", ".md"}:
+            return _read_text_file(path)
+    except Exception as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return ""
+
+    logger.warning("Unsupported file type %s for %s", suffix, path)
+    return ""
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _load_annotation_cache(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "docs": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("cache is not an object")
+        if "docs" not in data or not isinstance(data.get("docs"), dict):
+            data["docs"] = {}
+        data.setdefault("version", 1)
+        return data
+    except Exception as exc:
+        logger.warning("Failed to load cache %s: %s", path, exc)
+        return {"version": 1, "docs": {}}
+
+
+def _save_annotation_cache(path: Path, cache: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(cache, indent=2, ensure_ascii=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _chunk_cfg_signature(cfg: ChunkSplitConfig) -> Dict[str, Any]:
+    return {
+        "mode": cfg.mode,
+        "chunk_size": cfg.chunk_size,
+        "chunk_overlap": cfg.chunk_overlap,
+        "separators": cfg.separators or [],
+        "encoding_name": cfg.encoding_name,
+    }
+
+
+def _cache_key(file_path: str | None, doc_id: str) -> str:
+    return file_path or doc_id
+
+
+def _annotation_to_dict(ann: ChunkAnnotation) -> Dict[str, Any]:
+    return {
+        "chunk_type": ann.chunk_type,
+        "summary": ann.summary,
+        "entities": [{"name": e.name, "type": e.type} for e in ann.entities],
+        "relationships": ann.relationships,
+        "tags": ann.tags,
+        "candidate_qas": ann.candidate_qas,
+    }
+
+
+def _annotation_from_dict(data: Dict[str, Any]) -> ChunkAnnotation:
+    entities: List[Entity] = []
+    for e in data.get("entities", []) or []:
+        if isinstance(e, dict):
+            name = str(e.get("name", "")).strip()
+            etype = str(e.get("type", "OTHER")).strip().upper()
+            if name:
+                entities.append(Entity(name=name, type=etype))
+    relationships = [r for r in (data.get("relationships", []) or []) if isinstance(r, dict)]
+    tags = [t for t in (data.get("tags", []) or []) if isinstance(t, str)]
+    cqa = [q for q in (data.get("candidate_qas", []) or []) if isinstance(q, dict)]
+    return ChunkAnnotation(
+        chunk_type=str(data.get("chunk_type", "other")).strip(),
+        summary=str(data.get("summary", "")).strip() if data.get("summary") is not None else None,
+        entities=entities,
+        relationships=relationships,
+        tags=tags,
+        candidate_qas=cqa,
+    )
 
 
 def _print_banner(title: str, lines: List[str]) -> None:
@@ -38,6 +192,7 @@ def _print_commands() -> None:
     logger.info("  docs <topic>         - Search documents")
     logger.info("  entity <name>        - Show entity context")
     logger.info("  find <e1> <e2>        - Find path between entities")
+    logger.info("  trace [on|off]       - Toggle retrieval trace output")
     logger.info("  clear                - Clear chat history (stateless in this demo)")
 
 
@@ -67,6 +222,292 @@ def _print_graph_summary(client: Neo4jClient) -> None:
     logger.info("Tags:          %s", stats["tags"])
     logger.info("Relationships: %s", stats["relationships"])
     logger.info("=" * 40)
+
+
+def _shorten_text(text: str, limit: int = 220) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)] + "..."
+
+
+def _node_label(node: Dict[str, Any]) -> str:
+    labels = node.get("labels") or []
+    props = node.get("properties") or {}
+
+    if "Entity" in labels:
+        name = props.get("name") or "?"
+        return f"Entity({name})"
+    if "Chunk" in labels:
+        chunk_id = props.get("chunk_id") or "?"
+        return f"Chunk({chunk_id})"
+    if "Document" in labels:
+        title = props.get("title") or props.get("doc_id") or "Document"
+        return f"Document({_shorten_text(str(title), 40)})"
+    if "Tag" in labels:
+        name = props.get("name") or "?"
+        return f"Tag({name})"
+    if "FAQ" in labels:
+        faq_id = props.get("faq_id") or "?"
+        return f"FAQ({faq_id})"
+    if labels:
+        return f"{labels[0]}(id={node.get('id')})"
+    return f"Node(id={node.get('id')})"
+
+
+def _node_detail(node: Dict[str, Any]) -> str:
+    labels = node.get("labels") or []
+    props = node.get("properties") or {}
+    if "Entity" in labels:
+        return f"Entity name={props.get('name')} type={props.get('type')}"
+    if "Chunk" in labels:
+        return f"Chunk chunk_id={props.get('chunk_id')} doc_id={props.get('doc_id')}"
+    if "Document" in labels:
+        title = _shorten_text(str(props.get("title") or ""), 60)
+        return f"Document doc_id={props.get('doc_id')} title={title}"
+    if "Tag" in labels:
+        return f"Tag name={props.get('name')}"
+    if "FAQ" in labels:
+        q = _shorten_text(str(props.get("question") or ""), 60)
+        return f"FAQ faq_id={props.get('faq_id')} q={q}"
+    return f"Node labels={labels} props={props}"
+
+
+def _pick_keyword_node(nodes: List[Dict[str, Any]], term: str) -> Dict[str, Any] | None:
+    term_l = term.strip().lower()
+    if not term_l:
+        return None
+
+    candidates: List[tuple[int, int, int, str, Dict[str, Any]]] = []
+    for node in nodes:
+        labels = node.get("labels") or []
+        if "Entity" not in labels and "Tag" not in labels:
+            continue
+        props = node.get("properties") or {}
+        name = props.get("name")
+        if not name:
+            continue
+        name_str = str(name)
+        name_l = name_str.lower()
+        if name_l == term_l:
+            match_rank = 0
+        elif term_l in name_l:
+            match_rank = 1
+        else:
+            continue
+        label_rank = 0 if "Entity" in labels else 1
+        candidates.append((match_rank, label_rank, len(name_l), name_l, node))
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][4]
+
+
+def _shortest_path(adj: Dict[int, List[int]], start: int, goal: int) -> List[int]:
+    if start == goal:
+        return [start]
+    queue: deque[int] = deque([start])
+    prev: Dict[int, int | None] = {start: None}
+    while queue:
+        cur = queue.popleft()
+        for nxt in adj.get(cur, []):
+            if nxt in prev:
+                continue
+            prev[nxt] = cur
+            if nxt == goal:
+                queue.clear()
+                break
+            queue.append(nxt)
+    if goal not in prev:
+        return []
+    path: List[int] = []
+    node = goal
+    while node is not None:
+        path.append(node)
+        node = prev[node]
+    return list(reversed(path))
+
+
+def _build_keyword_path(debug: Dict[str, Any]) -> Dict[str, Any] | None:
+    terms = debug.get("terms") or []
+    graph_ctx = debug.get("graph_context") or {}
+    nodes = graph_ctx.get("nodes") or []
+    edges = graph_ctx.get("edges") or []
+    if not terms or not nodes:
+        return None
+
+    if len(terms) == 1:
+        node = _pick_keyword_node(nodes, terms[0])
+        if not node:
+            return {"path": [], "missing_terms": [terms[0]]}
+        props = node.get("properties") or {}
+        name = props.get("name")
+        return {"path": [str(name)] if name else [], "missing_terms": []}
+
+    if not edges:
+        return {"path": [], "missing_terms": terms}
+
+    node_by_id = {n.get("id"): n for n in nodes if n.get("id") is not None}
+    adj: Dict[int, List[int]] = {}
+    for e in edges:
+        start = e.get("start")
+        end = e.get("end")
+        if start is None or end is None:
+            continue
+        adj.setdefault(start, []).append(end)
+        adj.setdefault(end, []).append(start)
+
+    term_nodes: List[Dict[str, Any]] = []
+    missing_terms: List[str] = []
+    for term in terms:
+        node = _pick_keyword_node(nodes, term)
+        if node:
+            term_nodes.append(node)
+        else:
+            missing_terms.append(term)
+
+    if len(term_nodes) < 2:
+        return {"path": [], "missing_terms": missing_terms}
+
+    total_path: List[int] = []
+    current_id = term_nodes[0].get("id")
+    if current_id is None:
+        return {"path": [], "missing_terms": missing_terms}
+    total_path.append(current_id)
+
+    for node in term_nodes[1:]:
+        target_id = node.get("id")
+        if target_id is None:
+            continue
+        segment = _shortest_path(adj, current_id, target_id)
+        if not segment:
+            return {"path": [], "missing_terms": missing_terms}
+        total_path.extend(segment[1:])
+        current_id = target_id
+
+    keywords: List[str] = []
+    for node_id in total_path:
+        node = node_by_id.get(node_id)
+        if not node:
+            continue
+        labels = node.get("labels") or []
+        if "Entity" not in labels and "Tag" not in labels:
+            continue
+        props = node.get("properties") or {}
+        name = props.get("name")
+        if not name:
+            continue
+        name_str = str(name)
+        if not keywords or keywords[-1].lower() != name_str.lower():
+            keywords.append(name_str)
+
+    return {"path": keywords, "missing_terms": missing_terms}
+
+
+def _print_trace(debug: Dict[str, Any]) -> None:
+    if not debug:
+        logger.info("Trace not available.")
+        return
+
+    terms = debug.get("terms") or []
+    seed_ids = debug.get("seed_chunk_ids") or []
+    graph_ctx = debug.get("graph_context") or {}
+
+    nodes = graph_ctx.get("nodes") or []
+    edges = graph_ctx.get("edges") or []
+    docs = graph_ctx.get("documents") or []
+    tags = graph_ctx.get("tags") or []
+    entities = graph_ctx.get("entities") or []
+    faqs = graph_ctx.get("faqs") or []
+    seed_chunks = graph_ctx.get("seed_chunks") or []
+    neighbor_chunks = graph_ctx.get("neighbor_chunks") or []
+
+    logger.info("=" * 40)
+    logger.info("RETRIEVAL TRACE")
+    logger.info("=" * 40)
+    if terms:
+        logger.info("Query entities: %s", ", ".join(terms))
+    if seed_ids:
+        logger.info("Seed chunks: %s", ", ".join(seed_ids))
+
+    path_info = _build_keyword_path(debug)
+    if path_info:
+        path = path_info.get("path") or []
+        missing = path_info.get("missing_terms") or []
+        if path:
+            logger.info("Found text by this path -> %s", " -> ".join(path))
+            if missing:
+                logger.info("Path missing terms: %s", ", ".join(missing))
+        elif missing:
+            logger.info("Keyword path missing nodes for: %s", ", ".join(missing))
+        else:
+            logger.info("Keyword path not found in retrieved graph.")
+
+    if docs:
+        logger.info("Documents:")
+        for d in docs[:10]:
+            logger.info("  - %s (doc_id=%s)", d.get("title") or "<untitled>", d.get("doc_id"))
+
+    if entities:
+        entity_list = [f"{e.get('name')}[{e.get('type')}]" for e in entities[:TRACE_MAX_ENTITIES]]
+        logger.info("Entities: %s", ", ".join(entity_list))
+        if len(entities) > TRACE_MAX_ENTITIES:
+            logger.info("  ... +%s more", len(entities) - TRACE_MAX_ENTITIES)
+
+    if tags:
+        logger.info("Tags: %s", ", ".join(tags[:TRACE_MAX_TAGS]))
+        if len(tags) > TRACE_MAX_TAGS:
+            logger.info("  ... +%s more", len(tags) - TRACE_MAX_TAGS)
+
+    if faqs:
+        logger.info("FAQ nodes: %s", len(faqs))
+
+    if seed_chunks:
+        logger.info("Seed chunk context (%s):", len(seed_chunks))
+        for c in seed_chunks[:TRACE_MAX_CHUNKS]:
+            snippet = _shorten_text(c.get("text") or "")
+            logger.info(
+                "  - %s :: %s",
+                c.get("chunk_id"),
+                snippet,
+            )
+        if len(seed_chunks) > TRACE_MAX_CHUNKS:
+            logger.info("  ... +%s more", len(seed_chunks) - TRACE_MAX_CHUNKS)
+
+    if neighbor_chunks:
+        logger.info("Neighbor chunk context (%s):", len(neighbor_chunks))
+        for c in neighbor_chunks[:TRACE_MAX_CHUNKS]:
+            snippet = _shorten_text(c.get("text") or "")
+            logger.info(
+                "  - %s :: %s",
+                c.get("chunk_id"),
+                snippet,
+            )
+        if len(neighbor_chunks) > TRACE_MAX_CHUNKS:
+            logger.info("  ... +%s more", len(neighbor_chunks) - TRACE_MAX_CHUNKS)
+
+    if nodes:
+        label_counts: Dict[str, int] = {}
+        for n in nodes:
+            for label in n.get("labels") or []:
+                label_counts[label] = label_counts.get(label, 0) + 1
+        label_summary = ", ".join(f"{k}={v}" for k, v in sorted(label_counts.items()))
+        logger.info("Graph nodes: %s total%s", len(nodes), f" ({label_summary})" if label_summary else "")
+        for n in nodes[:TRACE_MAX_NODES]:
+            logger.info("  - %s", _node_detail(n))
+        if len(nodes) > TRACE_MAX_NODES:
+            logger.info("  ... +%s more", len(nodes) - TRACE_MAX_NODES)
+
+    if edges:
+        node_lookup = {n.get("id"): _node_label(n) for n in nodes if n.get("id") is not None}
+        logger.info("Graph edges: %s", len(edges))
+        for e in edges[:TRACE_MAX_EDGES]:
+            start = node_lookup.get(e.get("start"), f"id={e.get('start')}")
+            end = node_lookup.get(e.get("end"), f"id={e.get('end')}")
+            logger.info("  - %s -[%s]-> %s", start, e.get("type"), end)
+        if len(edges) > TRACE_MAX_EDGES:
+            logger.info("  ... +%s more", len(edges) - TRACE_MAX_EDGES)
 
 
 def _search_documents(client: Neo4jClient, topic: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -143,12 +584,28 @@ def ingest_data_json(client: Neo4jClient, graph: GraphRag, llm: LMStudioClient, 
     graph.setup_graph_schema()
     logger.info("Neo4j schema ready")
 
+    base_dir = Path(path).resolve().parent
+    chunk_cfg = ChunkSplitConfig(
+        mode=os.environ.get("CHUNK_MODE", "context"),
+        chunk_size=int(os.environ.get("CHUNK_SIZE", "1200")),
+        chunk_overlap=int(os.environ.get("CHUNK_OVERLAP", "200")),
+    )
+    chunk_cfg_sig = _chunk_cfg_signature(chunk_cfg)
+    cache = _load_annotation_cache(CACHE_FILE)
+    cache_docs: Dict[str, Any] = cache.get("docs", {})
+    cache_dirty = False
+
     for i, d in enumerate(docs):
         doc_id = f"doc_{i:03d}"
         title = d.get("title", "") or ""
         desc = d.get("description", "") or ""
         source_type = "json"
         source_id = d.get("file_path", f"row_{i}")
+        file_path = d.get("file_path")
+        resolved_path = None
+        if file_path:
+            p = Path(file_path)
+            resolved_path = p if p.is_absolute() else (base_dir / p)
 
         logger.info("Processing %s: %s", doc_id, title or "<untitled>")
 
@@ -157,42 +614,97 @@ def ingest_data_json(client: Neo4jClient, graph: GraphRag, llm: LMStudioClient, 
             title=title,
             source_type=source_type,
             source_id=str(source_id),
-            file_path=d.get("file_path"),
+            file_path=file_path,
+            description=desc,
+            source_keywords=d.get("keywords", []) or [],
         )
 
-        # one chunk per doc for MVP
-        chunk_id = f"{doc_id}_c000"
+        doc_text = _read_document_text(resolved_path) if resolved_path else ""
+        if not doc_text:
+            logger.warning("No text extracted for %s; using description as fallback.", doc_id)
+            doc_text = desc
+
+        content_hash = _hash_text(doc_text)
+        cache_key = _cache_key(str(resolved_path) if resolved_path else file_path, doc_id)
+        entry = cache_docs.get(cache_key)
+        use_cache = (
+            isinstance(entry, dict)
+            and entry.get("content_hash") == content_hash
+            and entry.get("chunk_cfg") == chunk_cfg_sig
+        )
+        cached_chunks: Dict[int, Dict[str, Any]] = {}
+        if use_cache:
+            for c in entry.get("chunks", []) or []:
+                idx = c.get("chunk_index")
+                if isinstance(idx, int):
+                    cached_chunks[idx] = c
+
+        chunks = llm.split_document(doc_id, doc_text, chunk_cfg, heading_path="content")
+        if not chunks:
+            logger.warning("No chunks produced for %s; skipping.", doc_id)
+            continue
+
+        chunk_ids = [c.chunk_id for c in chunks]
+        chunk_props = {
+            c.chunk_id: {
+                "text": c.text,
+                "heading_path": c.heading_path or "content",
+            }
+            for c in chunks
+        }
         graph.upsert_chunk_nodes(
             doc_id=doc_id,
-            chunk_ids=[chunk_id],
-            chunk_props={
-                chunk_id: {
-                    "text": desc,
-                    "heading_path": "description",
+            chunk_ids=chunk_ids,
+            chunk_props=chunk_props,
+        )
+
+        # LLM annotation -> entities/relationships + tags per chunk (with cache)
+        total_entities = 0
+        total_relationships = 0
+        total_tags = 0
+        updated_chunks: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            cached = cached_chunks.get(chunk.chunk_index)
+            cached_ann = cached.get("annotation") if isinstance(cached, dict) else None
+            if cached and cached.get("text_hash") == _hash_text(chunk.text) and isinstance(cached_ann, dict):
+                ann = _annotation_from_dict(cached_ann)
+            else:
+                ann = llm.annotate_chunk(chunk)
+                cache_dirty = True
+            graph.upsert_entities(chunk.chunk_id, ann.entities)
+            graph.upsert_entity_relationships(ann.relationships)
+            graph.upsert_tags(chunk.chunk_id, ann.tags)
+            total_entities += len(ann.entities)
+            total_relationships += len(ann.relationships)
+            total_tags += len(ann.tags)
+            updated_chunks.append(
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "chunk_index": chunk.chunk_index,
+                    "text_hash": _hash_text(chunk.text),
+                    "annotation": _annotation_to_dict(ann),
                 }
-            },
-        )
-
-        # tags from data.json keywords
-        keywords = d.get("keywords", []) or []
-        if isinstance(keywords, list):
-            graph.upsert_tags(chunk_id, [str(x) for x in keywords])
-
-        # LLM annotation -> entities/relationships + extra tags
-        ann = llm.annotate_chunk(
-            Chunk(chunk_id=chunk_id, doc_id=doc_id, chunk_index=0, text=desc)
-        )
-        graph.upsert_entities(chunk_id, ann.entities)
-        graph.upsert_entity_relationships(ann.relationships)
-        graph.upsert_tags(chunk_id, ann.tags)
+            )
+        cache_docs[cache_key] = {
+            "doc_id": doc_id,
+            "file_path": file_path,
+            "content_hash": content_hash,
+            "chunk_cfg": chunk_cfg_sig,
+            "chunks": updated_chunks,
+            "updated_at": int(time.time()),
+        }
         logger.info(
-            "  OK chunk=%s tags=%s entities=%s rels=%s extra_tags=%s",
-            chunk_id,
-            len(keywords) if isinstance(keywords, list) else 0,
-            len(ann.entities),
-            len(ann.relationships),
-            len(ann.tags),
+            "  OK chunks=%s entities=%s rels=%s tags=%s",
+            len(chunks),
+            total_entities,
+            total_relationships,
+            total_tags,
         )
+
+    if cache_dirty:
+        cache["docs"] = cache_docs
+        _save_annotation_cache(CACHE_FILE, cache)
+        logger.info("Saved LLM cache: %s", CACHE_FILE)
 
 
 def main() -> None:
@@ -205,13 +717,13 @@ def main() -> None:
     )
     neo4j_cfg = Neo4jConfig(
         uri=os.environ.get("NEO4J_URI", "neo4j://localhost:7687"),
-        username=os.environ.get("NEO4J_USER", "your_username_here"),  # replace with your username
-        password=os.environ.get("NEO4J_PASSWORD", "your_password_here"),  # replace with your password
+        username=os.environ.get("NEO4J_USER", "neo4j"),
+        password=os.environ.get("NEO4J_PASSWORD", "airestairest"),
     )
 
     lm_cfg = LMStudioConfig(
         base_url=os.environ.get("LMSTUDIO_URL", "http://localhost:1234"),
-        model=os.environ.get("LMSTUDIO_MODEL", "meta-llama-3.1-8b-instruct"),
+        model=os.environ.get("LMSTUDIO_MODEL", "qwen2.5-1.5b-instruct"),
     )
 
     client = Neo4jClient(neo4j_cfg)
@@ -236,6 +748,7 @@ def main() -> None:
         )
         _print_commands()
         query_count = 0
+        trace_enabled = True
         while True:
             q = input("\nYou> ").strip()
             if not q:
@@ -248,6 +761,17 @@ def main() -> None:
                 continue
             if q_lower == "stats":
                 _print_graph_summary(client)
+                continue
+            if q_lower.startswith("trace"):
+                parts = q_lower.split()
+                if len(parts) == 1:
+                    trace_enabled = not trace_enabled
+                elif len(parts) == 2 and parts[1] in {"on", "off"}:
+                    trace_enabled = parts[1] == "on"
+                else:
+                    logger.info("Usage: trace [on|off]")
+                    continue
+                logger.info("Trace mode: %s", "ON" if trace_enabled else "OFF")
                 continue
             if q_lower == "clear":
                 logger.info("Chat history cleared (stateless in this demo).")
@@ -306,13 +830,19 @@ def main() -> None:
                     logger.info("No path found between '%s' and '%s'", parts[0], parts[1])
                     continue
                 logger.info("Path distance: %s", path.get("distance"))
-                logger.info("Path: %s", " -> ".join(path.get("path_nodes") or []))
-                logger.info("Relations: %s", " | ".join(path.get("relations") or []))
+                path_nodes = [
+                    n for n in (path.get("path_nodes") or []) if isinstance(n, str) and n.strip()
+                ]
+                relations = [
+                    r for r in (path.get("relations") or []) if isinstance(r, str) and r.strip()
+                ]
+                logger.info("Path: %s", " -> ".join(path_nodes) if path_nodes else "<empty>")
+                logger.info("Relations: %s", " | ".join(relations) if relations else "<empty>")
                 continue
 
             query_count += 1
             logger.info("Query #%s: %s", query_count, q)
-            res = agent.answer(q)
+            res = agent.answer(q, include_trace=trace_enabled)
             print("\nAssistant>\n", res.answer)
 
             if res.citations:
@@ -320,8 +850,8 @@ def main() -> None:
                 for c in res.citations:
                     print(f"- {c.title} :: doc_id={c.doc_id} chunk_id={c.chunk_id}")
 
-            # debug is useful while iterating retrieval quality
-            # print("\nDEBUG:", res.debug)
+            if trace_enabled:
+                _print_trace(res.debug)
 
     finally:
         client.close()
