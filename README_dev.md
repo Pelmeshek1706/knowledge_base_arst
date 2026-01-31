@@ -174,7 +174,12 @@ If you see newly ingested docs/chunks in these queries, the update succeeded.
 - Add **document change detection** based on file mtime in addition to content hash.
 - Add **tests** for ingestion and cache correctness.
 - Improve **error handling** when LM Studio fails schema outputs.
-
+- add telegram/streamlit/gradio integrations
+- enchance document processing
+- created question-answer sessions "faq" document for quick answers and add it to tool
+- add tool calling to agent
+- add web search for additional context from internet as "tool"
+- add "wiki" for all documents by firstly implement mind map, then when user try to find some information - model generated an answer and add it to wiki
 ---
 
 ## Notes
