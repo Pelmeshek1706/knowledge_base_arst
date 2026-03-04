@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-import time
+import hashlib
+import math
+import os
+import re
 import requests
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Literal
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Literal
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
@@ -13,6 +17,28 @@ except Exception:  # pragma: no cover - optional dependency
     except Exception:  # pragma: no cover - optional dependency
         RecursiveCharacterTextSplitter = None  # type: ignore[assignment]
         TokenTextSplitter = None  # type: ignore[assignment]
+
+try:
+    from langsmith import traceable, tracing_context
+except Exception:  # pragma: no cover - optional dependency
+    def traceable(*decorator_args: Any, **decorator_kwargs: Any):  # type: ignore[no-redef]
+        # No-op fallback when langsmith is not available.
+        if (
+            decorator_args
+            and callable(decorator_args[0])
+            and len(decorator_args) == 1
+            and not decorator_kwargs
+        ):
+            return decorator_args[0]
+
+        def _decorator(func: Any) -> Any:
+            return func
+
+        return _decorator
+
+    @contextmanager
+    def tracing_context(*args: Any, **kwargs: Any) -> Iterator[None]:  # type: ignore[no-redef]
+        yield
 
 from graphrag.llm.base import (
     ChatMessage,
@@ -28,6 +54,54 @@ from graphrag.storage.neo4j_client import Neo4jClient
 SplitMode = Literal["context", "token"]
 
 DEFAULT_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
+
+
+def _parse_env_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _resolve_tracing_enabled(explicit_enabled: Optional[bool]) -> bool:
+    if explicit_enabled is not None:
+        return explicit_enabled
+    for key in (
+        "LANGSMITH_TRACING_V2",
+        "LANGSMITH_TRACING",
+        "LANGCHAIN_TRACING_V2",
+        "LANGCHAIN_TRACING",
+    ):
+        parsed = _parse_env_bool(os.environ.get(key))
+        if parsed is not None:
+            return parsed
+    return False
+
+
+def _split_csv_env(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item and item.strip()]
+
+
+def _trace_process_inputs(inputs: Any) -> Any:
+    if isinstance(inputs, dict):
+        return {k: v for k, v in inputs.items() if k != "self"}
+    return inputs
+
+
+def _trace_process_answer_output(output: Any) -> Any:
+    if isinstance(output, AnswerWithCitations):
+        return {
+            "answer_preview": output.answer[:300],
+            "citation_count": len(output.citations),
+            "debug_keys": sorted(output.debug.keys()),
+        }
+    return output
 
 
 @dataclass(frozen=True)
@@ -73,6 +147,9 @@ class LMStudioConfig:
     """
     base_url: str = "http://localhost:1234"
     model: str = "local-model"
+    embedding_model: Optional[str] = None
+    embedding_fallback: bool = True
+    local_embedding_dimensions: int = 384
     api_key: Optional[str] = None  # LM Studio typically ignores it, but some clients require it.
 
 
@@ -88,6 +165,10 @@ class LMStudioClient(LLMClient):
     def __init__(self, cfg: LMStudioConfig):
         self.cfg = cfg
         self._chat_url = self._normalize_chat_url(cfg.base_url)
+        self._embeddings_url = self._normalize_embeddings_url(cfg.base_url)
+        self.embedding_model = (cfg.embedding_model or cfg.model).strip()
+        self.local_embedding_dimensions = max(16, int(cfg.local_embedding_dimensions))
+        self.active_embedding_backend = "lmstudio"
 
     def split_text(self, text: str, cfg: Optional[ChunkSplitConfig] = None) -> List[str]:
         """
@@ -162,6 +243,13 @@ class LMStudioClient(LLMClient):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
 
+    @staticmethod
+    def _normalize_embeddings_url(base_url: str) -> str:
+        base = base_url.rstrip("/")
+        if base.endswith("/v1"):
+            return f"{base}/embeddings"
+        return f"{base}/v1/embeddings"
+
     def chat(
         self,
         messages: Sequence[ChatMessage],
@@ -179,6 +267,28 @@ class LMStudioClient(LLMClient):
         )
 
     def _chat_with_format(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float,
+        max_tokens: int,
+        timeout_s: int,
+        response_format: Optional[Dict[str, Any]],
+    ) -> str:
+        return self._chat_with_format_traced(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+            response_format=response_format,
+        )
+
+    @traceable(
+        run_type="llm",
+        name="lmstudio.chat_completion",
+        process_inputs=_trace_process_inputs,
+    )
+    def _chat_with_format_traced(
         self,
         messages: Sequence[ChatMessage],
         *,
@@ -205,6 +315,96 @@ class LMStudioClient(LLMClient):
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
+
+    def _local_hash_embedding(self, text: str) -> List[float]:
+        """
+        Deterministic local embedding fallback when /v1/embeddings is unavailable.
+        """
+        dims = self.local_embedding_dimensions
+        vec = [0.0] * dims
+        tokens = re.findall(r"[\w-]+", (text or "").lower())
+        if not tokens:
+            return vec
+
+        for token in tokens:
+            h = int(hashlib.sha1(token.encode("utf-8")).hexdigest(), 16)
+            idx = h % dims
+            sign = 1.0 if ((h >> 1) & 1) else -1.0
+            weight = 1.0 + ((h % 997) / 9970.0)
+            vec[idx] += sign * weight
+
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
+
+    def _local_hash_embeddings(self, texts: Sequence[str]) -> List[List[float]]:
+        self.active_embedding_backend = "local_hash"
+        return [self._local_hash_embedding(text) for text in texts]
+
+    @traceable(
+        run_type="llm",
+        name="lmstudio.embeddings",
+        process_inputs=_trace_process_inputs,
+    )
+    def embed_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int = 16,
+        timeout_s: int = 90,
+    ) -> List[List[float]]:
+        cleaned: List[str] = [" ".join((t or "").split()) for t in texts]
+        if not cleaned:
+            return []
+
+        step = max(1, int(batch_size))
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+
+        try:
+            vectors: List[List[float]] = []
+            for start in range(0, len(cleaned), step):
+                batch = cleaned[start : start + step]
+                payload: Dict[str, Any] = {
+                    "model": self.embedding_model,
+                    "input": batch,
+                }
+                resp = requests.post(self._embeddings_url, json=payload, headers=headers, timeout=timeout_s)
+                resp.raise_for_status()
+                data = resp.json()
+                rows = data.get("data") or []
+                if not isinstance(rows, list):
+                    raise RuntimeError("LM Studio embeddings response has invalid 'data' field.")
+
+                rows_sorted = sorted(rows, key=lambda x: int(x.get("index", 0)))
+                for row in rows_sorted:
+                    embedding = row.get("embedding")
+                    if not isinstance(embedding, list) or not embedding:
+                        raise RuntimeError("LM Studio embeddings response has empty/invalid embedding.")
+                    vectors.append([float(x) for x in embedding])
+
+            if len(vectors) != len(cleaned):
+                raise RuntimeError(
+                    f"LM Studio embeddings count mismatch: expected {len(cleaned)}, got {len(vectors)}."
+                )
+            self.active_embedding_backend = "lmstudio"
+            return vectors
+        except Exception:
+            if not self.cfg.embedding_fallback:
+                raise
+            return self._local_hash_embeddings(cleaned)
+
+    def embed_query(self, text: str, *, timeout_s: int = 90) -> List[float]:
+        vectors = self.embed_texts([text], timeout_s=timeout_s)
+        return vectors[0] if vectors else []
+
+    @property
+    def embedding_model_id(self) -> str:
+        if self.active_embedding_backend == "lmstudio":
+            return self.embedding_model
+        return f"local_hash_{self.local_embedding_dimensions}"
 
     def extract_query_entities(self, question: str, max_entities: int = 3) -> List[str]:
         prompt = (
@@ -469,13 +669,14 @@ Constraints:
 
 class GraphRagQAAgent:
     """
-    Minimal inference-time GraphRAG agent (graph-only retrieval).
+    Inference-time GraphRAG agent with hybrid retrieval (vector + graph).
 
-    Retrieval strategy (no vector store required):
+    Retrieval strategy:
       1) Use LLM to extract entity/topic strings from the question
-      2) Use those strings to find seed chunks via Entity/Tag matches in Neo4j
-      3) Expand neighborhood with GraphRag.expand_from_seeds()
-      4) Generate answer with LM Studio from assembled context
+      2) Seed chunks from graph matches (Entity/Tag) in Neo4j
+      3) Seed chunks from Neo4j vector kNN over Chunk embeddings
+      4) Union seeds and expand neighborhood with GraphRag.expand_from_seeds()
+      5) Generate answer with LM Studio from assembled context
 
     This works with the ingestion pipeline shown in the demo script.
     """
@@ -489,6 +690,11 @@ class GraphRagQAAgent:
         default_hops: int = 2,
         seed_limit: int = 8,
         expansion_limit: int = 50,
+        vector_top_k: int = 6,
+        vector_index_name: Optional[str] = None,
+        tracing_enabled: Optional[bool] = None,
+        tracing_project: Optional[str] = None,
+        tracing_tags: Optional[List[str]] = None,
     ):
         self.neo4j = neo4j
         self.graph = graph
@@ -496,7 +702,79 @@ class GraphRagQAAgent:
         self.default_hops = default_hops
         self.seed_limit = seed_limit
         self.expansion_limit = expansion_limit
+        self.vector_top_k = max(1, int(vector_top_k))
+        self.vector_index_name = (
+            vector_index_name
+            or os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index")
+        )
+        self.tracing_enabled = _resolve_tracing_enabled(tracing_enabled)
+        self.tracing_project = (
+            tracing_project
+            or os.environ.get("LANGSMITH_PROJECT")
+            or os.environ.get("LANGCHAIN_PROJECT")
+        )
+        self.tracing_tags = tracing_tags or _split_csv_env(
+            os.environ.get("LANGSMITH_TAGS") or os.environ.get("LANGCHAIN_TAGS")
+        )
 
+    @contextmanager
+    def _tracing_scope(self, *, question: str) -> Iterator[None]:
+        metadata = {
+            "agent": "GraphRagQAAgent",
+            "llm_provider": "lm_studio",
+            "llm_model": self.llm.cfg.model,
+            "embedding_model": self.llm.embedding_model_id,
+            "embedding_backend": self.llm.active_embedding_backend,
+            "llm_base_url": self.llm.cfg.base_url,
+            "default_hops": self.default_hops,
+            "seed_limit": self.seed_limit,
+            "expansion_limit": self.expansion_limit,
+            "vector_top_k": self.vector_top_k,
+            "vector_index_name": self.vector_index_name,
+            "question_chars": len(question or ""),
+        }
+        with tracing_context(
+            enabled=self.tracing_enabled,
+            project_name=self.tracing_project,
+            tags=self.tracing_tags,
+            metadata=metadata,
+        ):
+            yield
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.extract_query_entities",
+        process_inputs=_trace_process_inputs,
+    )
+    def _extract_query_terms(self, question: str) -> List[str]:
+        return self.llm.extract_query_entities(question, max_entities=3)
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.expand_from_seeds",
+        process_inputs=_trace_process_inputs,
+    )
+    def _expand_graph_context(self, seeds: List[str]) -> Dict[str, Any]:
+        return self.graph.expand_from_seeds(
+            seed_chunk_ids=seeds,
+            hops=self.default_hops,
+            limit=self.expansion_limit,
+            include_faq=True,
+        )
+
+    @traceable(
+        run_type="llm",
+        name="graph_rag.generate_answer",
+        process_inputs=_trace_process_inputs,
+    )
+    def _generate_answer_text(self, question: str, context_text: str) -> str:
+        return self.llm.generate_answer(question, context_text)
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.seed_chunks",
+        process_inputs=_trace_process_inputs,
+    )
     def _seed_chunks(self, terms: List[str]) -> List[str]:
         if not terms:
             return []
@@ -525,6 +803,23 @@ class GraphRagQAAgent:
         """
         rows = self.neo4j.run(cypher_tag, {"terms": terms, "limit": self.seed_limit})
         return [r["chunk_id"] for r in rows if r.get("chunk_id")]
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.vector_seed_chunks",
+        process_inputs=_trace_process_inputs,
+    )
+    def _vector_seed_chunks(self, question: str) -> List[Dict[str, Any]]:
+        if not question.strip():
+            return []
+        query_embedding = self.llm.embed_query(question)
+        if not query_embedding:
+            return []
+        return self.graph.vector_search_chunks(
+            query_embedding,
+            top_k=self.vector_top_k,
+            index_name=self.vector_index_name,
+        )
 
     @staticmethod
     def _enrich_context(ctx: Dict[str, Any], seed_chunk_ids: List[str]) -> Dict[str, Any]:
@@ -672,36 +967,117 @@ class GraphRagQAAgent:
             )
         return citations
 
+    @traceable(
+        run_type="chain",
+        name="graph_rag.answer",
+        process_inputs=_trace_process_inputs,
+        process_outputs=_trace_process_answer_output,
+    )
     def answer(self, question: str, *, include_trace: bool = False) -> AnswerWithCitations:
-        terms = self.llm.extract_query_entities(question, max_entities=3)
-        seeds = self._seed_chunks(terms)
+        with self._tracing_scope(question=question):
+            terms = self._extract_query_terms(question)
+            graph_seed_ids = self._seed_chunks(terms)
 
-        raw_ctx = self.graph.expand_from_seeds(
-            seed_chunk_ids=seeds,
-            hops=self.default_hops,
-            limit=self.expansion_limit,
-            include_faq=True,
-        )
-        ctx = self._enrich_context(raw_ctx, seeds)
-        context_text = self._render_context(ctx)
-        answer_text = self.llm.generate_answer(question, context_text)
+            vector_hits: List[Dict[str, Any]] = []
+            vector_seed_error: Optional[str] = None
+            try:
+                vector_hits = self._vector_seed_chunks(question)
+            except Exception as exc:
+                vector_seed_error = str(exc)
 
-        debug: Dict[str, Any] = {"terms": terms, "seed_chunk_ids": seeds}
-        if include_trace:
-            debug["graph_context"] = {
-                "nodes": ctx.get("nodes", []),
-                "edges": ctx.get("edges", []),
-                "documents": ctx.get("documents", []),
-                "tags": ctx.get("tags", []),
-                "entities": ctx.get("entities", []),
-                "faqs": ctx.get("faqs", []),
-                "seed_chunks": ctx.get("seed_chunks", []),
-                "neighbor_chunks": ctx.get("chunks", []),
+            vector_seed_ids = [r["chunk_id"] for r in vector_hits if r.get("chunk_id")]
+
+            merged_seed_ids: List[str] = []
+            seen: set[str] = set()
+            for cid in vector_seed_ids + graph_seed_ids:
+                if not cid or cid in seen:
+                    continue
+                merged_seed_ids.append(cid)
+                seen.add(cid)
+
+            raw_ctx = self._expand_graph_context(merged_seed_ids)
+            ctx = self._enrich_context(raw_ctx, merged_seed_ids)
+            context_text = self._render_context(ctx)
+            answer_text = self._generate_answer_text(question, context_text)
+
+            debug: Dict[str, Any] = {
+                "terms": terms,
+                "seed_chunk_ids": merged_seed_ids,
+                "graph_seed_chunk_ids": graph_seed_ids,
+                "vector_seed_chunk_ids": vector_seed_ids,
             }
-            debug["context_text"] = context_text
+            if include_trace:
+                debug["graph_context"] = {
+                    "nodes": ctx.get("nodes", []),
+                    "edges": ctx.get("edges", []),
+                    "documents": ctx.get("documents", []),
+                    "tags": ctx.get("tags", []),
+                    "entities": ctx.get("entities", []),
+                    "faqs": ctx.get("faqs", []),
+                    "seed_chunks": ctx.get("seed_chunks", []),
+                    "neighbor_chunks": ctx.get("chunks", []),
+                }
+                debug["context_text"] = context_text
+                debug["vector_hits"] = vector_hits
+                if vector_seed_error:
+                    debug["vector_seed_error"] = vector_seed_error
+                debug["observability"] = {
+                    "langsmith_enabled": self.tracing_enabled,
+                    "langsmith_project": self.tracing_project or "",
+                    "langsmith_tags": list(self.tracing_tags or []),
+                    "embedding_backend": self.llm.active_embedding_backend,
+                    "embedding_model": self.llm.embedding_model_id,
+                }
 
-        return AnswerWithCitations(
-            answer=answer_text,
-            citations=self._build_citations(ctx),
-            debug=debug,
-        )
+            return AnswerWithCitations(
+                answer=answer_text,
+                citations=self._build_citations(ctx),
+                debug=debug,
+            )
+
+    def invoke(self, payload: str | Dict[str, Any]) -> Dict[str, Any]:
+        """
+        LangChain-style invoke entrypoint.
+
+        Accepts either:
+          - plain string question
+          - {"question": "...", "include_trace": bool}
+        """
+        if isinstance(payload, str):
+            question = payload.strip()
+            include_trace = False
+        elif isinstance(payload, dict):
+            question = str(payload.get("question", "")).strip()
+            include_trace = bool(payload.get("include_trace", False))
+        else:
+            raise TypeError("payload must be str or dict")
+
+        if not question:
+            raise ValueError("question must be non-empty")
+
+        result = self.answer(question, include_trace=include_trace)
+        return {
+            "answer": result.answer,
+            "citations": [
+                {
+                    "doc_id": c.doc_id,
+                    "chunk_id": c.chunk_id,
+                    "title": c.title,
+                    "url": c.url,
+                    "score": c.score,
+                }
+                for c in result.citations
+            ],
+            "debug": result.debug,
+        }
+
+    def as_langchain_runnable(self) -> Any:
+        """
+        Build a Runnable adapter for LangChain/LangGraph pipelines.
+        """
+        try:
+            from langchain_core.runnables import RunnableLambda
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("langchain_core is required for runnable adapter.") from exc
+
+        return RunnableLambda(self.invoke).with_config(run_name="graph_rag_qa_agent")

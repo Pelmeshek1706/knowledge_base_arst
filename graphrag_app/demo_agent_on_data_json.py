@@ -36,6 +36,18 @@ CACHE_FILE = PROCESSED_DOCS_DIR / "llm_annotations.json"
 _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _read_text_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -412,6 +424,10 @@ def _print_trace(debug: Dict[str, Any]) -> None:
 
     terms = debug.get("terms") or []
     seed_ids = debug.get("seed_chunk_ids") or []
+    graph_seed_ids = debug.get("graph_seed_chunk_ids") or []
+    vector_seed_ids = debug.get("vector_seed_chunk_ids") or []
+    vector_hits = debug.get("vector_hits") or []
+    vector_seed_error = debug.get("vector_seed_error")
     graph_ctx = debug.get("graph_context") or {}
 
     nodes = graph_ctx.get("nodes") or []
@@ -430,6 +446,21 @@ def _print_trace(debug: Dict[str, Any]) -> None:
         logger.info("Query entities: %s", ", ".join(terms))
     if seed_ids:
         logger.info("Seed chunks: %s", ", ".join(seed_ids))
+    if vector_seed_ids:
+        logger.info("Vector seed chunks: %s", ", ".join(vector_seed_ids))
+    if graph_seed_ids:
+        logger.info("Graph seed chunks: %s", ", ".join(graph_seed_ids))
+    if vector_seed_error:
+        logger.info("Vector seed error: %s", vector_seed_error)
+    if vector_hits:
+        logger.info("Vector hits:")
+        for hit in vector_hits[:8]:
+            logger.info(
+                "  - %s score=%.4f title=%s",
+                hit.get("chunk_id"),
+                float(hit.get("score", 0.0)),
+                hit.get("title") or "<untitled>",
+            )
 
     path_info = _build_keyword_path(debug)
     if path_info:
@@ -583,6 +614,29 @@ def ingest_data_json(client: Neo4jClient, graph: GraphRag, llm: LMStudioClient, 
 
     graph.setup_graph_schema()
     logger.info("Neo4j schema ready")
+    vector_index_name = os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index")
+    vector_similarity = os.environ.get("NEO4J_VECTOR_SIMILARITY", "cosine")
+    logger.info(
+        "Vector retrieval config: index=%s similarity=%s embedding_model=%s backend=%s",
+        vector_index_name,
+        vector_similarity,
+        llm.embedding_model_id,
+        llm.active_embedding_backend,
+    )
+
+    vector_index_ready = False
+    existing_dim = graph.get_chunk_embedding_dimension()
+    if existing_dim:
+        try:
+            graph.setup_chunk_vector_index(
+                dimensions=existing_dim,
+                index_name=vector_index_name,
+                similarity_function=vector_similarity,
+            )
+            vector_index_ready = True
+            logger.info("Vector index is ready (existing dim=%s)", existing_dim)
+        except Exception as exc:
+            logger.warning("Failed to ensure vector index from existing embedding dim: %s", exc)
 
     base_dir = Path(path).resolve().parent
     chunk_cfg = ChunkSplitConfig(
@@ -658,6 +712,46 @@ def ingest_data_json(client: Neo4jClient, graph: GraphRag, llm: LMStudioClient, 
             chunk_props=chunk_props,
         )
 
+        embedded_rows = client.run(
+            """
+            MATCH (c:Chunk)
+            WHERE c.chunk_id IN $chunk_ids
+              AND c.embedding IS NOT NULL
+              AND c.embedding_model = $embedding_model
+            RETURN c.chunk_id AS chunk_id
+            """,
+            {"chunk_ids": chunk_ids, "embedding_model": llm.embedding_model_id},
+        )
+        embedded_chunk_ids = {r.get("chunk_id") for r in embedded_rows if r.get("chunk_id")}
+        chunks_to_embed = [c for c in chunks if c.chunk_id not in embedded_chunk_ids]
+        embedded_now = 0
+        if chunks_to_embed:
+            try:
+                vectors = llm.embed_texts([c.text for c in chunks_to_embed])
+                if vectors:
+                    if not vector_index_ready:
+                        graph.setup_chunk_vector_index(
+                            dimensions=len(vectors[0]),
+                            index_name=vector_index_name,
+                            similarity_function=vector_similarity,
+                        )
+                        vector_index_ready = True
+                    graph.upsert_chunk_embeddings(
+                        {
+                            chunk.chunk_id: vec
+                            for chunk, vec in zip(chunks_to_embed, vectors)
+                        },
+                        embedding_model=llm.embedding_model_id,
+                    )
+                    embedded_now = len(vectors)
+            except Exception as exc:
+                logger.warning(
+                    "Embedding failed for %s (%s chunks): %s",
+                    doc_id,
+                    len(chunks_to_embed),
+                    exc,
+                )
+
         # LLM annotation -> entities/relationships + tags per chunk (with cache)
         total_entities = 0
         total_relationships = 0
@@ -694,8 +788,12 @@ def ingest_data_json(client: Neo4jClient, graph: GraphRag, llm: LMStudioClient, 
             "updated_at": int(time.time()),
         }
         logger.info(
-            "  OK chunks=%s entities=%s rels=%s tags=%s",
+            "  OK chunks=%s embedded(new=%s cached=%s model=%s backend=%s) entities=%s rels=%s tags=%s",
             len(chunks),
+            embedded_now,
+            len(embedded_chunk_ids),
+            llm.embedding_model_id,
+            llm.active_embedding_backend,
             total_entities,
             total_relationships,
             total_tags,
@@ -716,7 +814,7 @@ def main() -> None:
         ],
     )
     neo4j_cfg = Neo4jConfig(
-        uri=os.environ.get("NEO4J_URI", "neo4j://localhost:7687"),
+        uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
         username=os.environ.get("NEO4J_USER", "neo4j"),
         password=os.environ.get("NEO4J_PASSWORD", "airestairest"),
     )
@@ -724,12 +822,22 @@ def main() -> None:
     lm_cfg = LMStudioConfig(
         base_url=os.environ.get("LMSTUDIO_URL", "http://localhost:1234"),
         model=os.environ.get("LMSTUDIO_MODEL", "qwen2.5-1.5b-instruct"),
+        embedding_model=os.environ.get("LMSTUDIO_EMBED_MODEL"),
+        embedding_fallback=_env_bool("LMSTUDIO_EMBED_FALLBACK", True),
+        local_embedding_dimensions=int(os.environ.get("LOCAL_EMBED_DIMENSIONS", "384")),
     )
 
     client = Neo4jClient(neo4j_cfg)
     client.connect()
     logger.info("Connected to Neo4j at %s", neo4j_cfg.uri)
-    logger.info("LM Studio: %s | model=%s", lm_cfg.base_url, lm_cfg.model)
+    logger.info(
+        "LM Studio: %s | chat_model=%s | embedding_model=%s | fallback=%s | local_dim=%s",
+        lm_cfg.base_url,
+        lm_cfg.model,
+        lm_cfg.embedding_model or lm_cfg.model,
+        lm_cfg.embedding_fallback,
+        lm_cfg.local_embedding_dimensions,
+    )
 
     try:
         graph = GraphRag(client)
@@ -740,7 +848,24 @@ def main() -> None:
         ingest_data_json(client, graph, llm, DATA_JSON)
         _print_graph_summary(client)
 
-        agent = GraphRagQAAgent(client, graph, llm, default_hops=2, seed_limit=8, expansion_limit=50)
+        agent = GraphRagQAAgent(
+            client,
+            graph,
+            llm,
+            default_hops=2,
+            seed_limit=8,
+            expansion_limit=50,
+            vector_top_k=int(os.environ.get("VECTOR_TOP_K", "6")),
+            vector_index_name=os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index"),
+        )
+        logger.info(
+            "LangSmith tracing: %s | project=%s | tags=%s | vector_top_k=%s | vector_index=%s",
+            "ON" if agent.tracing_enabled else "OFF",
+            agent.tracing_project or "<default>",
+            ",".join(agent.tracing_tags) if agent.tracing_tags else "<none>",
+            agent.vector_top_k,
+            agent.vector_index_name,
+        )
 
         _print_banner(
             "GraphRAG Agent using LM Studio",

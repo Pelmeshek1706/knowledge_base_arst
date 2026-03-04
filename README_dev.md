@@ -11,7 +11,7 @@ This project builds a lightweight GraphRAG pipeline on top of **Neo4j** and a lo
 - **LLM annotation** per chunk (entities, relationships, summary, candidate Q&A) using LM Studio.
 - **Keyword/tag extraction** using structured JSON output.
 - **Neo4j graph schema** creation and upserts for `Document`, `Chunk`, `Entity`, `Tag` and relationships.
-- **GraphRAG retrieval** (entity/tag seeding + graph expansion + answer generation).
+- **Hybrid GraphRAG retrieval** (vector kNN seeding + entity/tag seeding + graph expansion + answer generation).
 - **CLI commands** in the demo app (`stats`, `docs`, `entity`, `find`, `trace`).
 - **LLM result caching** to `processed_docs/llm_annotations.json` to avoid re‑processing unchanged documents.
 
@@ -70,15 +70,18 @@ docker run \
 Start LM Studio server with OpenAI‑compatible endpoints (default `http://localhost:1234/v1`).
 
 ### 3) Configure environment
-Configure these environment variables (override as needed):
+Configure these environment variables (override as needed). A ready template is in `env_sample`:
 
 ```bash
-export NEO4J_URI="neo4j://localhost:7687"
+export NEO4J_URI="bolt://localhost:7687"
 export NEO4J_USER="neo4j"
 export NEO4J_PASSWORD="airestairest"
 
 export LMSTUDIO_URL="http://localhost:1234"
 export LMSTUDIO_MODEL="qwen2.5-1.5b-instruct"
+export LMSTUDIO_EMBED_MODEL="text-embedding-nomic-embed-text-v1.5"
+export LMSTUDIO_EMBED_FALLBACK="true"     # fallback to local hash embeddings if /v1/embeddings is unsupported
+export LOCAL_EMBED_DIMENSIONS="384"       # used only for local hash fallback
 
 export DATA_JSON="/Users/pelmeshek1706/Desktop/projects/knowledge_agent/data/data.json"
 
@@ -89,6 +92,19 @@ export CHUNK_OVERLAP="200"
 
 # Cache location
 export PROCESSED_DOCS_DIR="processed_docs"
+
+# Hybrid retrieval (Neo4j vector + graph)
+export NEO4J_VECTOR_INDEX="chunk_embedding_index"
+export NEO4J_VECTOR_SIMILARITY="cosine"
+export VECTOR_TOP_K="6"
+
+# LangSmith tracing (optional, for LangChain/LangGraph observability)
+export LANGSMITH_TRACING="true"
+export LANGSMITH_API_KEY="<your_langsmith_key>"
+export LANGSMITH_PROJECT="knowledge-agent-local"
+# export LANGSMITH_ENDPOINT="https://api.smith.langchain.com"
+# export LANGSMITH_WORKSPACE_ID="<workspace_id>"
+# export LANGSMITH_TAGS="local,lmstudio,graphrag"
 ```
 
 ### 4) Run the demo app
@@ -158,11 +174,16 @@ If you see newly ingested docs/chunks in these queries, the update succeeded.
   - Calls `LMStudioClient.annotate_chunk` per chunk
   - Writes graph data to Neo4j
   - Caches LLM results in `processed_docs/llm_annotations.json`
+  - Prints LangSmith tracing status (ON/OFF) on startup
 
 - `graphrag_app/graphrag/llm/lm_studio.py`
   - LM Studio OpenAI‑style client
   - Structured output for keyword extraction + chunk annotation
+  - Embeddings via LM Studio `/v1/embeddings` with local hash fallback
   - Chunk splitting (context or token based)
+  - Hybrid retrieval in QA agent (vector + graph)
+  - LangSmith tracing hooks for GraphRAG pipeline spans
+  - LangChain-compatible `invoke()` and `as_langchain_runnable()` adapter
 
 ---
 

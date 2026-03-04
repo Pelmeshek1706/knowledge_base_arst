@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from neo4j.graph import Node, Relationship
 
@@ -40,6 +41,7 @@ class GraphRag:
         "FAQ": "faq_id",
         "Document": "doc_id",
     }
+    _VECTOR_INDEX_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
     def __init__(self, neo4j: Neo4jClient):
         self._neo4j = neo4j
@@ -145,6 +147,138 @@ class GraphRag:
             FOR (e:Entity)
             REQUIRE (e.name, e.type) IS UNIQUE
             """
+        )
+
+    @classmethod
+    def _validate_index_name(cls, index_name: str) -> str:
+        cleaned = (index_name or "").strip()
+        if not cleaned or not cls._VECTOR_INDEX_NAME_RE.match(cleaned):
+            raise ValueError(
+                "Invalid vector index name. Use letters, digits and underscore; must not start with a digit."
+            )
+        return cleaned
+
+    def setup_chunk_vector_index(
+        self,
+        *,
+        dimensions: int,
+        index_name: str = "chunk_embedding_index",
+        similarity_function: str = "cosine",
+    ) -> None:
+        """
+        Create Neo4j vector index for :Chunk(embedding).
+        """
+        dims = int(dimensions)
+        if dims <= 0:
+            raise ValueError("dimensions must be > 0")
+
+        similarity = (similarity_function or "cosine").strip().lower()
+        if similarity not in {"cosine", "euclidean"}:
+            raise ValueError("similarity_function must be one of: cosine, euclidean")
+
+        idx_name = self._validate_index_name(index_name)
+        cypher = f"""
+        CREATE VECTOR INDEX {idx_name} IF NOT EXISTS
+        FOR (c:Chunk) ON (c.embedding)
+        OPTIONS {{
+          indexConfig: {{
+            `vector.dimensions`: {dims},
+            `vector.similarity_function`: '{similarity}'
+          }}
+        }}
+        """
+        self._neo4j.execute_write(cypher)
+
+    def get_chunk_embedding_dimension(self) -> Optional[int]:
+        """
+        Return embedding dimensionality from existing Chunk nodes if available.
+        """
+        rows = self._neo4j.run(
+            """
+            MATCH (c:Chunk)
+            WHERE c.embedding IS NOT NULL
+            RETURN size(c.embedding) AS dim
+            LIMIT 1
+            """
+        )
+        if not rows:
+            return None
+        dim = rows[0].get("dim")
+        return int(dim) if dim is not None else None
+
+    def upsert_chunk_embeddings(
+        self,
+        chunk_embeddings: Dict[str, List[float]],
+        *,
+        embedding_model: str,
+    ) -> None:
+        """
+        Store/update embeddings on Chunk nodes.
+        """
+        if not chunk_embeddings:
+            return
+
+        rows: List[Dict[str, Any]] = []
+        for chunk_id, embedding in chunk_embeddings.items():
+            if not chunk_id or not embedding:
+                continue
+            rows.append(
+                {
+                    "chunk_id": chunk_id,
+                    "embedding": [float(x) for x in embedding],
+                }
+            )
+        if not rows:
+            return
+
+        self._neo4j.execute_write(
+            """
+            UNWIND $rows AS row
+            MATCH (c:Chunk {chunk_id: row.chunk_id})
+            SET c.embedding = row.embedding,
+                c.embedding_model = $embedding_model,
+                c.embedding_dim = size(row.embedding),
+                c.embedding_updated_at = datetime(),
+                c.updated_at = datetime()
+            """,
+            {"rows": rows, "embedding_model": embedding_model},
+        )
+
+    def vector_search_chunks(
+        self,
+        query_embedding: List[float],
+        *,
+        top_k: int = 8,
+        index_name: str = "chunk_embedding_index",
+        include_doc_url: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run kNN vector retrieval over Chunk nodes in Neo4j.
+        """
+        if not query_embedding:
+            return []
+
+        idx_name = self._validate_index_name(index_name)
+        k = max(1, int(top_k))
+        base = f"""
+        CALL db.index.vector.queryNodes('{idx_name}', $top_k, $embedding)
+        YIELD node, score
+        WHERE coalesce(node.active, true)
+        OPTIONAL MATCH (d:Document)-[:CONTAINS]->(node)
+        RETURN node.chunk_id AS chunk_id,
+               node.text AS text,
+               node.doc_id AS doc_id,
+               d.doc_id AS document_id,
+               d.title AS title,
+               score AS score
+        """
+        if include_doc_url:
+            base = base.rstrip() + ",\n       d.url AS url\n"
+        cypher = base + "\nORDER BY score DESC\nLIMIT $top_k"
+
+        return self._neo4j.run(
+            cypher,
+            {"top_k": k, "embedding": [float(x) for x in query_embedding]},
         )
 
     # ------------------------------------------------------------------
