@@ -428,6 +428,7 @@ def _print_trace(debug: Dict[str, Any]) -> None:
     vector_seed_ids = debug.get("vector_seed_chunk_ids") or []
     vector_hits = debug.get("vector_hits") or []
     vector_seed_error = debug.get("vector_seed_error")
+    reranked_chunks = debug.get("reranked_chunks") or []
     graph_ctx = debug.get("graph_context") or {}
 
     nodes = graph_ctx.get("nodes") or []
@@ -460,6 +461,18 @@ def _print_trace(debug: Dict[str, Any]) -> None:
                 hit.get("chunk_id"),
                 float(hit.get("score", 0.0)),
                 hit.get("title") or "<untitled>",
+            )
+    if reranked_chunks:
+        logger.info("Top reranked chunks:")
+        for item in reranked_chunks[:8]:
+            logger.info(
+                "  - %s score=%.4f source=%s v=%s g=%s t=%s",
+                item.get("chunk_id"),
+                float(item.get("retrieval_score", 0.0)),
+                item.get("source"),
+                item.get("vector"),
+                item.get("graph"),
+                item.get("term"),
             )
 
     path_info = _build_keyword_path(debug)
@@ -498,9 +511,12 @@ def _print_trace(debug: Dict[str, Any]) -> None:
         logger.info("Seed chunk context (%s):", len(seed_chunks))
         for c in seed_chunks[:TRACE_MAX_CHUNKS]:
             snippet = _shorten_text(c.get("text") or "")
+            score = c.get("retrieval_score")
+            score_part = f" (score={float(score):.4f})" if score is not None else ""
             logger.info(
-                "  - %s :: %s",
+                "  - %s%s :: %s",
                 c.get("chunk_id"),
+                score_part,
                 snippet,
             )
         if len(seed_chunks) > TRACE_MAX_CHUNKS:
@@ -510,9 +526,12 @@ def _print_trace(debug: Dict[str, Any]) -> None:
         logger.info("Neighbor chunk context (%s):", len(neighbor_chunks))
         for c in neighbor_chunks[:TRACE_MAX_CHUNKS]:
             snippet = _shorten_text(c.get("text") or "")
+            score = c.get("retrieval_score")
+            score_part = f" (score={float(score):.4f})" if score is not None else ""
             logger.info(
-                "  - %s :: %s",
+                "  - %s%s :: %s",
                 c.get("chunk_id"),
+                score_part,
                 snippet,
             )
         if len(neighbor_chunks) > TRACE_MAX_CHUNKS:
@@ -857,14 +876,32 @@ def main() -> None:
             expansion_limit=50,
             vector_top_k=int(os.environ.get("VECTOR_TOP_K", "6")),
             vector_index_name=os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index"),
+            seed_rrf_k=int(os.environ.get("HYBRID_SEED_RRF_K", "60")),
+            context_seed_limit=int(os.environ.get("HYBRID_CONTEXT_SEED_LIMIT", "16")),
+            context_neighbor_limit=int(os.environ.get("HYBRID_CONTEXT_NEIGHBOR_LIMIT", "24")),
+            rerank_vector_weight=float(os.environ.get("HYBRID_RERANK_VECTOR_WEIGHT", "0.55")),
+            rerank_graph_weight=float(os.environ.get("HYBRID_RERANK_GRAPH_WEIGHT", "0.25")),
+            rerank_term_weight=float(os.environ.get("HYBRID_RERANK_TERM_WEIGHT", "0.20")),
+            rerank_seed_boost=float(os.environ.get("HYBRID_RERANK_SEED_BOOST", "0.10")),
         )
         logger.info(
-            "LangSmith tracing: %s | project=%s | tags=%s | vector_top_k=%s | vector_index=%s",
+            (
+                "LangSmith tracing: %s | project=%s | tags=%s | vector_top_k=%s "
+                "| vector_index=%s | rrf_k=%s | ctx_seed=%s | ctx_neighbor=%s "
+                "| rerank(v=%.2f g=%.2f t=%.2f seed=%.2f)"
+            ),
             "ON" if agent.tracing_enabled else "OFF",
             agent.tracing_project or "<default>",
             ",".join(agent.tracing_tags) if agent.tracing_tags else "<none>",
             agent.vector_top_k,
             agent.vector_index_name,
+            agent.seed_rrf_k,
+            agent.context_seed_limit,
+            agent.context_neighbor_limit,
+            agent.rerank_vector_weight,
+            agent.rerank_graph_weight,
+            agent.rerank_term_weight,
+            agent.rerank_seed_boost,
         )
 
         _print_banner(

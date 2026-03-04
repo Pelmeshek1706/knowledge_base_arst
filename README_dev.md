@@ -97,6 +97,13 @@ export PROCESSED_DOCS_DIR="processed_docs"
 export NEO4J_VECTOR_INDEX="chunk_embedding_index"
 export NEO4J_VECTOR_SIMILARITY="cosine"
 export VECTOR_TOP_K="6"
+export HYBRID_SEED_RRF_K="60"
+export HYBRID_CONTEXT_SEED_LIMIT="16"
+export HYBRID_CONTEXT_NEIGHBOR_LIMIT="24"
+export HYBRID_RERANK_VECTOR_WEIGHT="0.55"
+export HYBRID_RERANK_GRAPH_WEIGHT="0.25"
+export HYBRID_RERANK_TERM_WEIGHT="0.20"
+export HYBRID_RERANK_SEED_BOOST="0.10"
 
 # LangSmith tracing (optional, for LangChain/LangGraph observability)
 export LANGSMITH_TRACING="true"
@@ -181,7 +188,7 @@ If you see newly ingested docs/chunks in these queries, the update succeeded.
   - Structured output for keyword extraction + chunk annotation
   - Embeddings via LM Studio `/v1/embeddings` with local hash fallback
   - Chunk splitting (context or token based)
-  - Hybrid retrieval in QA agent (vector + graph)
+  - Hybrid retrieval in QA agent (vector + graph + RRF seed merge + rerank)
   - LangSmith tracing hooks for GraphRAG pipeline spans
   - LangChain-compatible `invoke()` and `as_langchain_runnable()` adapter
 

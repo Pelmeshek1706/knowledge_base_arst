@@ -7,7 +7,7 @@ import re
 import requests
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Literal
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Literal
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
@@ -692,6 +692,13 @@ class GraphRagQAAgent:
         expansion_limit: int = 50,
         vector_top_k: int = 6,
         vector_index_name: Optional[str] = None,
+        seed_rrf_k: int = 60,
+        context_seed_limit: int = 16,
+        context_neighbor_limit: int = 24,
+        rerank_vector_weight: float = 0.55,
+        rerank_graph_weight: float = 0.25,
+        rerank_term_weight: float = 0.20,
+        rerank_seed_boost: float = 0.10,
         tracing_enabled: Optional[bool] = None,
         tracing_project: Optional[str] = None,
         tracing_tags: Optional[List[str]] = None,
@@ -707,6 +714,13 @@ class GraphRagQAAgent:
             vector_index_name
             or os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index")
         )
+        self.seed_rrf_k = max(1, int(seed_rrf_k))
+        self.context_seed_limit = max(1, int(context_seed_limit))
+        self.context_neighbor_limit = max(1, int(context_neighbor_limit))
+        self.rerank_vector_weight = max(0.0, float(rerank_vector_weight))
+        self.rerank_graph_weight = max(0.0, float(rerank_graph_weight))
+        self.rerank_term_weight = max(0.0, float(rerank_term_weight))
+        self.rerank_seed_boost = max(0.0, float(rerank_seed_boost))
         self.tracing_enabled = _resolve_tracing_enabled(tracing_enabled)
         self.tracing_project = (
             tracing_project
@@ -731,6 +745,13 @@ class GraphRagQAAgent:
             "expansion_limit": self.expansion_limit,
             "vector_top_k": self.vector_top_k,
             "vector_index_name": self.vector_index_name,
+            "seed_rrf_k": self.seed_rrf_k,
+            "context_seed_limit": self.context_seed_limit,
+            "context_neighbor_limit": self.context_neighbor_limit,
+            "rerank_vector_weight": self.rerank_vector_weight,
+            "rerank_graph_weight": self.rerank_graph_weight,
+            "rerank_term_weight": self.rerank_term_weight,
+            "rerank_seed_boost": self.rerank_seed_boost,
             "question_chars": len(question or ""),
         }
         with tracing_context(
@@ -782,9 +803,12 @@ class GraphRagQAAgent:
         # 1) seed by entity name match
         cypher_ent = """
         MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
-        WHERE any(t IN $terms WHERE toLower(e.name) CONTAINS toLower(t))
-          AND coalesce(c.active, true)
-        RETURN DISTINCT c.chunk_id AS chunk_id
+        WHERE coalesce(c.active, true)
+        WITH c, collect(toLower(e.name)) AS entity_names
+        WITH c, size([term IN $terms WHERE any(name IN entity_names WHERE name CONTAINS toLower(term))]) AS match_count
+        WHERE match_count > 0
+        RETURN c.chunk_id AS chunk_id
+        ORDER BY match_count DESC, c.chunk_index ASC
         LIMIT $limit
         """
         rows = self.neo4j.run(cypher_ent, {"terms": terms, "limit": self.seed_limit})
@@ -796,9 +820,12 @@ class GraphRagQAAgent:
         # 2) fallback: seed by tag match
         cypher_tag = """
         MATCH (c:Chunk)-[:HAS_TAG]->(t:Tag)
-        WHERE any(x IN $terms WHERE toLower(t.name) CONTAINS toLower(x))
-          AND coalesce(c.active, true)
-        RETURN DISTINCT c.chunk_id AS chunk_id
+        WHERE coalesce(c.active, true)
+        WITH c, collect(toLower(t.name)) AS tag_names
+        WITH c, size([term IN $terms WHERE any(name IN tag_names WHERE name CONTAINS toLower(term))]) AS match_count
+        WHERE match_count > 0
+        RETURN c.chunk_id AS chunk_id
+        ORDER BY match_count DESC, c.chunk_index ASC
         LIMIT $limit
         """
         rows = self.neo4j.run(cypher_tag, {"terms": terms, "limit": self.seed_limit})
@@ -820,6 +847,196 @@ class GraphRagQAAgent:
             top_k=self.vector_top_k,
             index_name=self.vector_index_name,
         )
+
+    @staticmethod
+    def _minmax_normalize(values: Dict[str, float]) -> Dict[str, float]:
+        if not values:
+            return {}
+        lo = min(values.values())
+        hi = max(values.values())
+        if math.isclose(lo, hi):
+            return {k: 1.0 for k in values}
+        span = hi - lo
+        return {k: (v - lo) / span for k, v in values.items()}
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.merge_hybrid_seeds",
+        process_inputs=_trace_process_inputs,
+    )
+    def _merge_seed_candidates(
+        self,
+        graph_seed_ids: List[str],
+        vector_hits: List[Dict[str, Any]],
+    ) -> Tuple[List[str], List[str], Dict[str, Dict[str, Any]]]:
+        graph_seed_ids = [cid for cid in graph_seed_ids if cid]
+        graph_seed_ids = list(dict.fromkeys(graph_seed_ids))
+
+        vector_ranked: List[Tuple[str, float]] = []
+        for hit in vector_hits:
+            chunk_id = str(hit.get("chunk_id") or "").strip()
+            if not chunk_id:
+                continue
+            try:
+                score = float(hit.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            vector_ranked.append((chunk_id, score))
+
+        vector_ranked.sort(key=lambda x: x[1], reverse=True)
+        vector_seed_ids = list(dict.fromkeys([cid for cid, _ in vector_ranked]))
+
+        vector_score_raw: Dict[str, float] = {}
+        for cid, score in vector_ranked:
+            prev = vector_score_raw.get(cid)
+            if prev is None or score > prev:
+                vector_score_raw[cid] = score
+        vector_norm = self._minmax_normalize(vector_score_raw)
+
+        graph_rank = {cid: idx + 1 for idx, cid in enumerate(graph_seed_ids)}
+        vector_rank = {cid: idx + 1 for idx, cid in enumerate(vector_seed_ids)}
+
+        candidate_ids = list(dict.fromkeys(vector_seed_ids + graph_seed_ids))
+        seed_signals: Dict[str, Dict[str, Any]] = {}
+        for cid in candidate_ids:
+            rrf_score = 0.0
+            if cid in vector_rank:
+                rrf_score += 1.0 / (self.seed_rrf_k + vector_rank[cid])
+            if cid in graph_rank:
+                rrf_score += 1.0 / (self.seed_rrf_k + graph_rank[cid])
+
+            seed_signals[cid] = {
+                "chunk_id": cid,
+                "rrf_score": rrf_score,
+                "vector_score": vector_score_raw.get(cid, 0.0),
+                "vector_norm": vector_norm.get(cid, 0.0),
+                "vector_rank": vector_rank.get(cid),
+                "graph_rank": graph_rank.get(cid),
+            }
+
+        rrf_norm = self._minmax_normalize(
+            {cid: float(meta.get("rrf_score", 0.0)) for cid, meta in seed_signals.items()}
+        )
+        for cid, meta in seed_signals.items():
+            meta["rrf_norm"] = rrf_norm.get(cid, 0.0)
+            meta["merge_score"] = meta["rrf_score"] + 0.15 * meta["vector_norm"]
+
+        merged_seed_ids = sorted(
+            candidate_ids,
+            key=lambda cid: (
+                float(seed_signals[cid].get("merge_score", 0.0)),
+                float(seed_signals[cid].get("vector_score", 0.0)),
+                1.0 if seed_signals[cid].get("graph_rank") is not None else 0.0,
+                cid,
+            ),
+            reverse=True,
+        )
+        return merged_seed_ids, vector_seed_ids, seed_signals
+
+    def _score_chunk_for_rerank(
+        self,
+        chunk: Dict[str, Any],
+        terms_lower: List[str],
+        seed_signals: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        chunk_id = str(chunk.get("chunk_id") or "")
+        signal = seed_signals.get(chunk_id, {})
+
+        vector_signal = float(signal.get("vector_norm", 0.0) or 0.0)
+        graph_signal = 1.0 if signal.get("graph_rank") is not None else 0.0
+        seed_signal = 1.0 if signal else 0.0
+        hybrid_rank_signal = float(signal.get("rrf_norm", 0.0) or 0.0)
+
+        text_lower = str(chunk.get("text") or "").lower()
+        term_signal = 0.0
+        if terms_lower:
+            matched = sum(1 for term in terms_lower if term and term in text_lower)
+            term_signal = matched / float(len(terms_lower))
+
+        score = (
+            self.rerank_vector_weight * vector_signal
+            + self.rerank_graph_weight * max(graph_signal, hybrid_rank_signal)
+            + self.rerank_term_weight * term_signal
+            + self.rerank_seed_boost * seed_signal
+        )
+        return {
+            "score": float(score),
+            "vector_signal": vector_signal,
+            "graph_signal": graph_signal,
+            "term_signal": term_signal,
+            "seed_signal": seed_signal,
+            "hybrid_rank_signal": hybrid_rank_signal,
+        }
+
+    @traceable(
+        run_type="retriever",
+        name="graph_rag.rerank_context",
+        process_inputs=_trace_process_inputs,
+    )
+    def _rerank_enriched_context(
+        self,
+        ctx: Dict[str, Any],
+        terms: List[str],
+        seed_signals: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        terms_lower = [t.strip().lower() for t in terms if isinstance(t, str) and t.strip()]
+
+        def _rerank_chunks(chunks: List[Dict[str, Any]], limit: int, source: str) -> List[Dict[str, Any]]:
+            ranked: List[Dict[str, Any]] = []
+            for chunk in chunks:
+                item = dict(chunk)
+                score_meta = self._score_chunk_for_rerank(item, terms_lower, seed_signals)
+                item["retrieval_score"] = round(float(score_meta["score"]), 6)
+                item["retrieval_components"] = {
+                    "vector": round(float(score_meta["vector_signal"]), 6),
+                    "graph": round(float(score_meta["graph_signal"]), 6),
+                    "term": round(float(score_meta["term_signal"]), 6),
+                    "seed": round(float(score_meta["seed_signal"]), 6),
+                    "hybrid_rank": round(float(score_meta["hybrid_rank_signal"]), 6),
+                    "source": source,
+                }
+                ranked.append(item)
+            ranked.sort(
+                key=lambda c: (
+                    float(c.get("retrieval_score", 0.0) or 0.0),
+                    str(c.get("chunk_id") or ""),
+                ),
+                reverse=True,
+            )
+            return ranked[: max(1, int(limit))]
+
+        seed_chunks = _rerank_chunks(
+            list(ctx.get("seed_chunks", []) or []),
+            self.context_seed_limit,
+            "seed",
+        )
+        neighbor_chunks = _rerank_chunks(
+            list(ctx.get("chunks", []) or []),
+            self.context_neighbor_limit,
+            "neighbor",
+        )
+
+        reranked_debug: List[Dict[str, Any]] = []
+        for chunk in seed_chunks + neighbor_chunks:
+            comps = chunk.get("retrieval_components") or {}
+            reranked_debug.append(
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "doc_id": chunk.get("doc_id"),
+                    "retrieval_score": chunk.get("retrieval_score"),
+                    "source": comps.get("source"),
+                    "vector": comps.get("vector"),
+                    "graph": comps.get("graph"),
+                    "term": comps.get("term"),
+                    "seed": comps.get("seed"),
+                    "hybrid_rank": comps.get("hybrid_rank"),
+                }
+            )
+
+        updated = dict(ctx)
+        updated["seed_chunks"] = seed_chunks
+        updated["chunks"] = neighbor_chunks
+        return updated, reranked_debug
 
     @staticmethod
     def _enrich_context(ctx: Dict[str, Any], seed_chunk_ids: List[str]) -> Dict[str, Any]:
@@ -956,13 +1173,15 @@ class GraphRagQAAgent:
 
         for c in (ctx.get("seed_chunks", []) or [])[:10]:
             doc_id = c.get("doc_id")
+            score = c.get("retrieval_score")
+            citation_score = float(score) if score is not None else None
             citations.append(
                 Citation(
                     doc_id=doc_id or "",
                     chunk_id=c.get("chunk_id") or "",
                     title=doc_title.get(doc_id, "") or "",
                     url=None,
-                    score=None,
+                    score=citation_score,
                 )
             )
         return citations
@@ -985,18 +1204,14 @@ class GraphRagQAAgent:
             except Exception as exc:
                 vector_seed_error = str(exc)
 
-            vector_seed_ids = [r["chunk_id"] for r in vector_hits if r.get("chunk_id")]
-
-            merged_seed_ids: List[str] = []
-            seen: set[str] = set()
-            for cid in vector_seed_ids + graph_seed_ids:
-                if not cid or cid in seen:
-                    continue
-                merged_seed_ids.append(cid)
-                seen.add(cid)
+            merged_seed_ids, vector_seed_ids, seed_signals = self._merge_seed_candidates(
+                graph_seed_ids,
+                vector_hits,
+            )
 
             raw_ctx = self._expand_graph_context(merged_seed_ids)
             ctx = self._enrich_context(raw_ctx, merged_seed_ids)
+            ctx, reranked_chunks = self._rerank_enriched_context(ctx, terms, seed_signals)
             context_text = self._render_context(ctx)
             answer_text = self._generate_answer_text(question, context_text)
 
@@ -1005,6 +1220,7 @@ class GraphRagQAAgent:
                 "seed_chunk_ids": merged_seed_ids,
                 "graph_seed_chunk_ids": graph_seed_ids,
                 "vector_seed_chunk_ids": vector_seed_ids,
+                "seed_merge_signals": list(seed_signals.values()),
             }
             if include_trace:
                 debug["graph_context"] = {
@@ -1019,6 +1235,7 @@ class GraphRagQAAgent:
                 }
                 debug["context_text"] = context_text
                 debug["vector_hits"] = vector_hits
+                debug["reranked_chunks"] = reranked_chunks
                 if vector_seed_error:
                     debug["vector_seed_error"] = vector_seed_error
                 debug["observability"] = {
@@ -1027,6 +1244,14 @@ class GraphRagQAAgent:
                     "langsmith_tags": list(self.tracing_tags or []),
                     "embedding_backend": self.llm.active_embedding_backend,
                     "embedding_model": self.llm.embedding_model_id,
+                    "vector_top_k": self.vector_top_k,
+                    "seed_rrf_k": self.seed_rrf_k,
+                    "context_seed_limit": self.context_seed_limit,
+                    "context_neighbor_limit": self.context_neighbor_limit,
+                    "rerank_vector_weight": self.rerank_vector_weight,
+                    "rerank_graph_weight": self.rerank_graph_weight,
+                    "rerank_term_weight": self.rerank_term_weight,
+                    "rerank_seed_boost": self.rerank_seed_boost,
                 }
 
             return AnswerWithCitations(
