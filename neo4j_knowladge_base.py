@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Legacy prototype module.
+
+This file is intentionally kept for backwards reference and notebook examples.
+Current runtime path uses modules under `graphrag_app/graphrag/`.
+"""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional

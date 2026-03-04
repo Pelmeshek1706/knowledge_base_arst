@@ -5,6 +5,7 @@ import math
 import os
 import re
 import requests
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Literal
@@ -792,6 +793,11 @@ class GraphRagQAAgent:
         tracing_project: Optional[str] = None,
         tracing_tags: Optional[List[str]] = None,
     ):
+        warnings.warn(
+            "GraphRagQAAgent is deprecated. Use StateGraphKnowledgeAgent from graphrag.orchestrator.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.neo4j = neo4j
         self.graph = graph
         self.llm = llm

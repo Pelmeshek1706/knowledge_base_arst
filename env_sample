@@ -11,6 +11,17 @@ LMSTUDIO_EMBED_FALLBACK=true
 LOCAL_EMBED_DIMENSIONS=384
 # LMSTUDIO_API_KEY=
 
+# StateGraph agent runtime (LangChain-native model layer)
+AGENT_RUNTIME=stategraph
+AGENT_MODEL=qwen2.5-1.5b-instruct
+AGENT_BASE_URL=http://localhost:1234
+AGENT_API_KEY=lm-studio
+AGENT_EMBED_MODEL=text-embedding-nomic-embed-text-v1.5
+AGENT_WEB_BUDGET=2
+AGENT_DEEP_LINK_BUDGET=1
+AGENT_GRAPH_PNG_PATH=graphrag_app/artifacts/agent_stategraph.png
+AGENT_GRAPH_MERMAID_PATH=graphrag_app/artifacts/agent_stategraph.mmd
+
 # Optional absolute path to source JSON file
 DATA_JSON=/Users/pelmeshek1706/Desktop/projects/knowledge_agent/data/data.json
 

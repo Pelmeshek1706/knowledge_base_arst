@@ -114,6 +114,18 @@ export MCP_WEB_MAX_RESULTS="5"
 # Optional explicit search tool name, e.g. "duckduckgo.search"
 # export MCP_WEB_SEARCH_TOOL="duckduckgo.search"
 
+# Agent runtime (StateGraph by default; set "legacy" to use old loop)
+export AGENT_RUNTIME="stategraph"        # stategraph | legacy
+export AGENT_MODEL="qwen2.5-1.5b-instruct"
+export AGENT_BASE_URL="http://localhost:1234"
+export AGENT_API_KEY="lm-studio"
+export AGENT_EMBED_MODEL="text-embedding-nomic-embed-text-v1.5"
+export AGENT_WEB_BUDGET="2"
+export AGENT_DEEP_LINK_BUDGET="1"
+export AGENT_GRAPH_PNG_PATH="graphrag_app/artifacts/agent_stategraph.png"
+# Optional path to save startup StateGraph Mermaid diagram
+export AGENT_GRAPH_MERMAID_PATH="graphrag_app/artifacts/agent_stategraph.mmd"
+
 # LangSmith tracing (optional, for LangChain/LangGraph observability)
 export LANGSMITH_TRACING="true"
 export LANGSMITH_API_KEY="<your_langsmith_key>"
@@ -130,6 +142,7 @@ PYTHONPATH=graphrag_app python graphrag_app/demo_agent_on_data_json.py
 ```
 
 On first run, it ingests documents, annotates chunks with the LLM, and writes results into Neo4j. Later runs reuse cached annotations if the document text and chunking config are unchanged.
+At startup, the agent saves a StateGraph PNG diagram to `AGENT_GRAPH_PNG_PATH` (and Mermaid source to `AGENT_GRAPH_MERMAID_PATH`).
 
 ---
 
