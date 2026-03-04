@@ -104,6 +104,46 @@ def _trace_process_answer_output(output: Any) -> Any:
     return output
 
 
+_QUERY_ENTITY_STOPWORDS = {
+    "what",
+    "which",
+    "where",
+    "when",
+    "who",
+    "why",
+    "how",
+    "about",
+    "know",
+    "tell",
+    "more",
+    "there",
+    "they",
+    "them",
+    "this",
+    "that",
+    "with",
+    "from",
+    "into",
+    "по",
+    "про",
+    "что",
+    "там",
+    "знаем",
+    "какая",
+    "какой",
+    "какие",
+    "где",
+    "когда",
+    "сейчас",
+    "сегодня",
+    "мне",
+    "тебе",
+    "для",
+    "или",
+    "как",
+}
+
+
 @dataclass(frozen=True)
 class ChunkSplitConfig:
     """
@@ -412,14 +452,38 @@ class LMStudioClient(LLMClient):
             "Return ONLY a JSON array of strings, no extra text.\n\n"
             "Question:\n{q}\n"
         ).format(n=max_entities, q=question)
-
-        raw = self.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=200)
-        arr = expect_json_array(raw)
         out: List[str] = []
-        for x in arr:
-            if isinstance(x, str) and x.strip():
-                out.append(x.strip())
-        return out[:max_entities]
+        try:
+            raw = self.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=200)
+            arr = expect_json_array(raw)
+            for x in arr:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+            if out:
+                return out[:max_entities]
+        except Exception:
+            pass
+
+        # Fallback for models that occasionally return plain text instead of JSON.
+        tokens = re.findall(r"[\w-]+", (question or ""), flags=re.UNICODE)
+        seen: set[str] = set()
+        for token in tokens:
+            term = token.strip()
+            if len(term) < 3:
+                continue
+            term_l = term.lower()
+            if term_l in _QUERY_ENTITY_STOPWORDS:
+                continue
+            if term_l in seen:
+                continue
+            seen.add(term_l)
+            out.append(term)
+            if len(out) >= max_entities:
+                break
+
+        if out:
+            return out[:max_entities]
+        return [question.strip()[:80]] if question.strip() else []
 
     def extract_keywords(
         self,
@@ -660,11 +724,36 @@ Constraints:
             "If the context is insufficient, say what is missing.\n"
             "When referring to facts, cite the document titles explicitly.\n"
         )
-        messages: List[ChatMessage] = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"},
-        ]
-        return self.chat(messages, temperature=0.3, max_tokens=1500)
+        def _messages(ctx: str) -> List[ChatMessage]:
+            return [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion:\n{question}\n\nAnswer:"},
+            ]
+
+        base_context = context or ""
+        try:
+            return self.chat(_messages(base_context), temperature=0.3, max_tokens=1500)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status != 400:
+                raise
+
+            # Retry with reduced context for local models that reject large prompts.
+            for limit in (8000, 5000, 3000, 1800):
+                if len(base_context) <= limit:
+                    continue
+                compact = base_context[:limit] + "\n...[context truncated due model limits]..."
+                try:
+                    return self.chat(_messages(compact), temperature=0.3, max_tokens=1200)
+                except requests.HTTPError as retry_exc:
+                    retry_status = retry_exc.response.status_code if retry_exc.response is not None else None
+                    if retry_status != 400:
+                        raise
+                    exc = retry_exc
+
+            # Last-resort answer without full context, preserving user question handling.
+            fallback_ctx = "Context omitted because model rejected oversized prompt."
+            return self.chat(_messages(fallback_ctx), temperature=0.3, max_tokens=800)
 
 
 class GraphRagQAAgent:
@@ -790,6 +879,24 @@ class GraphRagQAAgent:
     )
     def _generate_answer_text(self, question: str, context_text: str) -> str:
         return self.llm.generate_answer(question, context_text)
+
+    @staticmethod
+    def _merge_context(
+        graph_context_text: str,
+        supplemental_context: Optional[str],
+    ) -> str:
+        extra = (supplemental_context or "").strip()
+        if not extra:
+            return graph_context_text
+
+        max_extra_chars = max(200, int(os.environ.get("SUPPLEMENTAL_CONTEXT_MAX_CHARS", "2200")))
+        if len(extra) > max_extra_chars:
+            extra = extra[: max_extra_chars - 3] + "..."
+        return (
+            f"{graph_context_text}\n\n"
+            "EXTERNAL TOOL CONTEXT:\n"
+            f"{extra}"
+        )
 
     @traceable(
         run_type="retriever",
@@ -1192,7 +1299,13 @@ class GraphRagQAAgent:
         process_inputs=_trace_process_inputs,
         process_outputs=_trace_process_answer_output,
     )
-    def answer(self, question: str, *, include_trace: bool = False) -> AnswerWithCitations:
+    def answer(
+        self,
+        question: str,
+        *,
+        include_trace: bool = False,
+        supplemental_context: Optional[str] = None,
+    ) -> AnswerWithCitations:
         with self._tracing_scope(question=question):
             terms = self._extract_query_terms(question)
             graph_seed_ids = self._seed_chunks(terms)
@@ -1212,7 +1325,8 @@ class GraphRagQAAgent:
             raw_ctx = self._expand_graph_context(merged_seed_ids)
             ctx = self._enrich_context(raw_ctx, merged_seed_ids)
             ctx, reranked_chunks = self._rerank_enriched_context(ctx, terms, seed_signals)
-            context_text = self._render_context(ctx)
+            graph_context_text = self._render_context(ctx)
+            context_text = self._merge_context(graph_context_text, supplemental_context)
             answer_text = self._generate_answer_text(question, context_text)
 
             debug: Dict[str, Any] = {
@@ -1234,6 +1348,8 @@ class GraphRagQAAgent:
                     "neighbor_chunks": ctx.get("chunks", []),
                 }
                 debug["context_text"] = context_text
+                if supplemental_context:
+                    debug["supplemental_context"] = supplemental_context
                 debug["vector_hits"] = vector_hits
                 debug["reranked_chunks"] = reranked_chunks
                 if vector_seed_error:
@@ -1266,21 +1382,29 @@ class GraphRagQAAgent:
 
         Accepts either:
           - plain string question
-          - {"question": "...", "include_trace": bool}
+          - {"question": "...", "include_trace": bool, "supplemental_context": "..."}
         """
         if isinstance(payload, str):
             question = payload.strip()
             include_trace = False
+            supplemental_context = None
         elif isinstance(payload, dict):
             question = str(payload.get("question", "")).strip()
             include_trace = bool(payload.get("include_trace", False))
+            supplemental_context = payload.get("supplemental_context")
+            if supplemental_context is not None:
+                supplemental_context = str(supplemental_context)
         else:
             raise TypeError("payload must be str or dict")
 
         if not question:
             raise ValueError("question must be non-empty")
 
-        result = self.answer(question, include_trace=include_trace)
+        result = self.answer(
+            question,
+            include_trace=include_trace,
+            supplemental_context=supplemental_context,
+        )
         return {
             "answer": result.answer,
             "citations": [

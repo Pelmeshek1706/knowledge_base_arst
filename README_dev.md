@@ -11,8 +11,10 @@ This project builds a lightweight GraphRAG pipeline on top of **Neo4j** and a lo
 - **LLM annotation** per chunk (entities, relationships, summary, candidate Q&A) using LM Studio.
 - **Keyword/tag extraction** using structured JSON output.
 - **Neo4j graph schema** creation and upserts for `Document`, `Chunk`, `Entity`, `Tag` and relationships.
-- **Hybrid GraphRAG retrieval** (vector kNN seeding + entity/tag seeding + graph expansion + answer generation).
-- **CLI commands** in the demo app (`stats`, `docs`, `entity`, `find`, `trace`).
+- **GraphRAG retrieval API** with `GraphRag.search(query)` returning context chunks for agent tools.
+- **CLI commands** in the demo app (`stats`, `tools`, `web`, `tool`, `docs`, `entity`, `find`, `trace`).
+- **Tool-orchestrated agent**: planner LLM chooses tools (`graph_search` / web search), executes them, then generates final answer from tool outputs.
+- **MCP tool integration layer** via reusable provider/registry classes (`graphrag.tools`).
 - **LLM result caching** to `processed_docs/llm_annotations.json` to avoid re‑processing unchanged documents.
 
 ---
@@ -105,6 +107,13 @@ export HYBRID_RERANK_GRAPH_WEIGHT="0.25"
 export HYBRID_RERANK_TERM_WEIGHT="0.20"
 export HYBRID_RERANK_SEED_BOOST="0.10"
 
+# MCP tools (Docker MCP Toolkit)
+export ENABLE_MCP_TOOLS="true"
+export MCP_TOOL_TIMEOUT_S="30"
+export MCP_WEB_MAX_RESULTS="5"
+# Optional explicit search tool name, e.g. "duckduckgo.search"
+# export MCP_WEB_SEARCH_TOOL="duckduckgo.search"
+
 # LangSmith tracing (optional, for LangChain/LangGraph observability)
 export LANGSMITH_TRACING="true"
 export LANGSMITH_API_KEY="<your_langsmith_key>"
@@ -182,15 +191,34 @@ If you see newly ingested docs/chunks in these queries, the update succeeded.
   - Writes graph data to Neo4j
   - Caches LLM results in `processed_docs/llm_annotations.json`
   - Prints LangSmith tracing status (ON/OFF) on startup
+  - Builds tool registry from:
+    - `graph_search` (local Neo4j GraphRAG search)
+    - MCP web-search tool from Docker (`docker mcp tools ...`)
+  - Uses `ToolOrchestratedAgent`: model chooses tool(s), tool output is used as context, then model generates final answer
+  - Adds commands:
+    - `tools` to list available tools
+    - `web <query>` for explicit web-search call
+    - `tool <name> <json>` for generic direct tool calls
 
 - `graphrag_app/graphrag/llm/lm_studio.py`
   - LM Studio OpenAI‑style client
   - Structured output for keyword extraction + chunk annotation
   - Embeddings via LM Studio `/v1/embeddings` with local hash fallback
   - Chunk splitting (context or token based)
-  - Hybrid retrieval in QA agent (vector + graph + RRF seed merge + rerank)
+  - Hybrid retrieval in QA agent (kept as reusable component)
   - LangSmith tracing hooks for GraphRAG pipeline spans
   - LangChain-compatible `invoke()` and `as_langchain_runnable()` adapter
+
+- `graphrag_app/graphrag/tools/`
+  - `GraphRagToolProvider` for local graph search as a tool
+  - `DockerMcpToolProvider` for MCP tools from Docker Desktop
+  - `AgentToolRegistry` to aggregate multiple tool providers
+
+- `graphrag_app/graphrag/orchestrator/tool_agent.py`
+  - `ToolOrchestratedAgent` planner/executor/finalizer flow:
+    - plan tool calls from user question
+    - execute selected tools
+    - generate final answer from tool results
 
 ---
 

@@ -15,8 +15,16 @@ import xml.etree.ElementTree as ET
 from graphrag.config import Neo4jConfig
 from graphrag.storage.neo4j_client import Neo4jClient
 from graphrag.graph.graph_rag import GraphRag
-from graphrag.llm.lm_studio import LMStudioClient, LMStudioConfig, GraphRagQAAgent, ChunkSplitConfig
+from graphrag.llm.lm_studio import LMStudioClient, LMStudioConfig, ChunkSplitConfig
+from graphrag.orchestrator import ToolOrchestratedAgent, ToolAgentResult
 from graphrag.types.models import Chunk, ChunkAnnotation, Entity
+from graphrag.tools import (
+    AgentToolRegistry,
+    DockerMcpToolProvider,
+    GraphRagToolProvider,
+    ToolCallResult,
+    ToolExecutionError,
+)
 
 DATA_JSON = os.environ.get("DATA_JSON", "/Users/pelmeshek1706/Desktop/projects/knowledge_agent/data/data.json")  # adjust for your machine
 
@@ -201,6 +209,9 @@ def _print_commands() -> None:
     logger.info("  exit | quit          - Exit session")
     logger.info("  help | ?             - Show commands")
     logger.info("  stats                - Show graph stats")
+    logger.info("  tools                - Show available tools (GraphRAG + MCP)")
+    logger.info("  web <query>          - Run web-search tool directly")
+    logger.info("  tool <name> <json>   - Call any tool directly")
     logger.info("  docs <topic>         - Search documents")
     logger.info("  entity <name>        - Show entity context")
     logger.info("  find <e1> <e2>        - Find path between entities")
@@ -241,6 +252,103 @@ def _shorten_text(text: str, limit: int = 220) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(0, limit - 3)] + "..."
+
+
+def _choose_web_search_tool(tool_names: List[str]) -> str | None:
+    if not tool_names:
+        return None
+
+    preferred = sorted(
+        [n for n in tool_names if "duckduckgo" in n.lower() and n.lower().endswith("search")]
+    )
+    if preferred:
+        return preferred[0]
+
+    generic = sorted(
+        [
+            n
+            for n in tool_names
+            if (n.lower().endswith("search") or n == "search")
+            and n.lower() not in {"graph_search"}
+        ]
+    )
+    if generic:
+        return generic[0]
+    return None
+
+
+def _tool_output_to_text(value: Any, *, max_chars: int = 5000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+    elif isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+    else:
+        text = str(value)
+
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def _build_tool_registry(graph: GraphRag) -> tuple[AgentToolRegistry, str | None]:
+    providers = [GraphRagToolProvider(graph)]
+    web_search_tool: str | None = None
+
+    if _env_bool("ENABLE_MCP_TOOLS", True):
+        timeout_s = int(os.environ.get("MCP_TOOL_TIMEOUT_S", "30"))
+        providers.append(DockerMcpToolProvider(timeout_s=timeout_s))
+
+    registry = AgentToolRegistry(providers)
+    names = [t.name for t in registry.list_tools(refresh=True)]
+    if names:
+        logger.info("Discovered tools: %s", ", ".join(names))
+        explicit = os.environ.get("MCP_WEB_SEARCH_TOOL", "").strip()
+        if explicit:
+            resolved = registry.resolve_tool_name(explicit)
+            if resolved:
+                web_search_tool = resolved
+            else:
+                logger.warning("MCP_WEB_SEARCH_TOOL='%s' not found; using auto-detected web tool.", explicit)
+        if not web_search_tool:
+            web_search_tool = _choose_web_search_tool(names)
+    else:
+        logger.info("No tools discovered.")
+
+    return registry, web_search_tool
+
+
+def _call_web_search(
+    registry: AgentToolRegistry,
+    search_tool_name: str,
+    query: str,
+) -> ToolCallResult:
+    max_results = int(os.environ.get("MCP_WEB_MAX_RESULTS", "5"))
+    return registry.call_tool(
+        search_tool_name,
+        {"query": query, "max_results": max_results},
+    )
+
+
+def _print_tool_agent_trace(result: ToolAgentResult) -> None:
+    planned = result.planned_calls
+    executed = result.executed_results
+    logger.info("=" * 40)
+    logger.info("TOOL TRACE")
+    logger.info("=" * 40)
+    if not planned:
+        logger.info("Planner produced no tool calls.")
+    else:
+        logger.info("Planned calls:")
+        for call in planned:
+            logger.info("  - %s args=%s", call.tool_name, call.arguments)
+    if not executed:
+        logger.info("No tool calls executed successfully.")
+    else:
+        logger.info("Executed calls:")
+        for item in executed:
+            logger.info("  - %s provider=%s", item.tool_name, item.provider)
 
 
 def _node_label(node: Dict[str, Any]) -> str:
@@ -862,46 +970,34 @@ def main() -> None:
         graph = GraphRag(client)
         graph.allowed_relationship_types = {"RELATED_TO", "USES", "REQUIRES", "PART_OF"}
         llm = LMStudioClient(lm_cfg)
+        logger.info(
+            "LangSmith tracing: enabled=%s project=%s endpoint=%s",
+            getattr(llm, "tracing_enabled", False),
+            getattr(llm, "tracing_project", "") or "<unset>",
+            os.environ.get("LANGSMITH_ENDPOINT", "<unset>"),
+        )
 
         # Ingest once (comment out if already ingested)
         ingest_data_json(client, graph, llm, DATA_JSON)
         _print_graph_summary(client)
 
-        agent = GraphRagQAAgent(
-            client,
-            graph,
+        tool_registry, web_search_tool = _build_tool_registry(graph)
+        if web_search_tool:
+            logger.info("Web tool selected: %s", web_search_tool)
+        else:
+            logger.info("No dedicated web-search tool found. Planner will use available tools.")
+
+        planner_tools = ["graph_search"]
+        if web_search_tool:
+            planner_tools.append(web_search_tool)
+        orchestrated_agent = ToolOrchestratedAgent(
             llm,
-            default_hops=2,
-            seed_limit=8,
-            expansion_limit=50,
-            vector_top_k=int(os.environ.get("VECTOR_TOP_K", "6")),
-            vector_index_name=os.environ.get("NEO4J_VECTOR_INDEX", "chunk_embedding_index"),
-            seed_rrf_k=int(os.environ.get("HYBRID_SEED_RRF_K", "60")),
-            context_seed_limit=int(os.environ.get("HYBRID_CONTEXT_SEED_LIMIT", "16")),
-            context_neighbor_limit=int(os.environ.get("HYBRID_CONTEXT_NEIGHBOR_LIMIT", "24")),
-            rerank_vector_weight=float(os.environ.get("HYBRID_RERANK_VECTOR_WEIGHT", "0.55")),
-            rerank_graph_weight=float(os.environ.get("HYBRID_RERANK_GRAPH_WEIGHT", "0.25")),
-            rerank_term_weight=float(os.environ.get("HYBRID_RERANK_TERM_WEIGHT", "0.20")),
-            rerank_seed_boost=float(os.environ.get("HYBRID_RERANK_SEED_BOOST", "0.10")),
-        )
-        logger.info(
-            (
-                "LangSmith tracing: %s | project=%s | tags=%s | vector_top_k=%s "
-                "| vector_index=%s | rrf_k=%s | ctx_seed=%s | ctx_neighbor=%s "
-                "| rerank(v=%.2f g=%.2f t=%.2f seed=%.2f)"
-            ),
-            "ON" if agent.tracing_enabled else "OFF",
-            agent.tracing_project or "<default>",
-            ",".join(agent.tracing_tags) if agent.tracing_tags else "<none>",
-            agent.vector_top_k,
-            agent.vector_index_name,
-            agent.seed_rrf_k,
-            agent.context_seed_limit,
-            agent.context_neighbor_limit,
-            agent.rerank_vector_weight,
-            agent.rerank_graph_weight,
-            agent.rerank_term_weight,
-            agent.rerank_seed_boost,
+            tool_registry,
+            max_tool_calls=int(os.environ.get("TOOL_AGENT_MAX_CALLS", "2")),
+            context_max_chars=int(os.environ.get("TOOL_AGENT_CONTEXT_MAX_CHARS", "12000")),
+            allowed_tools=planner_tools,
+            max_deep_links=int(os.environ.get("TOOL_AGENT_DEEP_LINKS", "1")),
+            max_research_iterations=int(os.environ.get("TOOL_AGENT_RESEARCH_ITERATIONS", "2")),
         )
 
         _print_banner(
@@ -923,6 +1019,61 @@ def main() -> None:
                 continue
             if q_lower == "stats":
                 _print_graph_summary(client)
+                continue
+            if q_lower == "tools":
+                try:
+                    tools = tool_registry.list_tools(refresh=True)
+                except ToolExecutionError as exc:
+                    logger.info("Failed to list tools: %s", exc)
+                    continue
+                if not tools:
+                    logger.info("No MCP tools discovered.")
+                    continue
+                logger.info("MCP tools (%s):", len(tools))
+                for spec in tools:
+                    suffix = f" :: {spec.description}" if spec.description else ""
+                    logger.info("  - %s%s", spec.name, suffix)
+                continue
+            if q_lower.startswith("tool "):
+                raw = q[5:].strip()
+                if not raw:
+                    logger.info("Usage: tool <name> <json-arguments>")
+                    continue
+                tool_name, sep, args_raw = raw.partition(" ")
+                payload: Dict[str, Any] = {}
+                if sep and args_raw.strip():
+                    try:
+                        parsed = json.loads(args_raw.strip())
+                    except json.JSONDecodeError as exc:
+                        logger.info("Invalid JSON arguments: %s", exc)
+                        continue
+                    if not isinstance(parsed, dict):
+                        logger.info("Tool arguments must be a JSON object.")
+                        continue
+                    payload = parsed
+                try:
+                    result = tool_registry.call_tool(tool_name, payload)
+                except ToolExecutionError as exc:
+                    logger.info("Tool call failed: %s", exc)
+                    continue
+                text = _tool_output_to_text(result.output)
+                logger.info("Tool result (%s):\n%s", result.tool_name, text or "<empty>")
+                continue
+            if q_lower.startswith("web "):
+                if not web_search_tool:
+                    logger.info("DuckDuckGo MCP search tool is not configured.")
+                    continue
+                query = q[4:].strip()
+                if not query:
+                    logger.info("Usage: web <query>")
+                    continue
+                try:
+                    result = _call_web_search(tool_registry, web_search_tool, query)
+                except ToolExecutionError as exc:
+                    logger.info("Web search failed: %s", exc)
+                    continue
+                text = _tool_output_to_text(result.output)
+                logger.info("Web results:\n%s", text or "<empty>")
                 continue
             if q_lower.startswith("trace"):
                 parts = q_lower.split()
@@ -1004,16 +1155,10 @@ def main() -> None:
 
             query_count += 1
             logger.info("Query #%s: %s", query_count, q)
-            res = agent.answer(q, include_trace=trace_enabled)
-            print("\nAssistant>\n", res.answer)
-
-            if res.citations:
-                print("\nCitations:")
-                for c in res.citations:
-                    print(f"- {c.title} :: doc_id={c.doc_id} chunk_id={c.chunk_id}")
-
+            result = orchestrated_agent.answer(q)
+            print("\nAssistant>\n", result.answer)
             if trace_enabled:
-                _print_trace(res.debug)
+                _print_tool_agent_trace(result)
 
     finally:
         client.close()
