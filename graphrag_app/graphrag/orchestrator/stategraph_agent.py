@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -39,6 +39,11 @@ class _FollowupOutput(BaseModel):
     query: str = Field(..., min_length=1)
 
 
+class _RouteOutput(BaseModel):
+    route: Literal["graph_first", "web_first"] = Field(...)
+    reason: str = Field(default="")
+
+
 class StateGraphKnowledgeAgent:
     """StateGraph-based orchestrator for graph/web tool usage."""
 
@@ -70,6 +75,7 @@ class StateGraphKnowledgeAgent:
 
     def _build_graph(self):
         builder = StateGraph(AgentState)
+        builder.add_node("router_node", self._router_node)
         builder.add_node("plan_node", self._plan_node)
         builder.add_node("tool_node", self.tool_node)
         builder.add_node("research_gate_node", self._research_gate_node)
@@ -77,7 +83,15 @@ class StateGraphKnowledgeAgent:
         builder.add_node("followup_search_node", self._followup_search_node)
         builder.add_node("finalize_node", self._finalize_node)
 
-        builder.add_edge(START, "plan_node")
+        builder.add_edge(START, "router_node")
+        builder.add_conditional_edges(
+            "router_node",
+            self._route_after_router,
+            {
+                "tool_node": "tool_node",
+                "plan_node": "plan_node",
+            },
+        )
         builder.add_conditional_edges(
             "plan_node",
             tools_condition,
@@ -221,14 +235,125 @@ class StateGraphKnowledgeAgent:
             lines.append(f"{idx}. {source.title} — {source.url}")
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _is_realtime_query(question: str) -> bool:
+        q = (question or "").lower()
+        if not q:
+            return False
+        markers = {
+            "latest",
+            "current",
+            "today",
+            "news",
+            "breaking",
+            "weather",
+            "forecast",
+            "stock",
+            "price",
+            "exchange rate",
+            "market cap",
+            "what happened",
+            "сегодня",
+            "последние",
+            "новости",
+            "курс",
+            "погода",
+        }
+        return any(marker in q for marker in markers)
+
+    def _route_question(self, question: str) -> PlannerDecision:
+        if self.toolset.graph_tool and not self.toolset.web_tool:
+            return PlannerDecision(next_step="graph_first", reason="graph_only_available")
+        if self.toolset.web_tool and not self.toolset.graph_tool:
+            return PlannerDecision(next_step="web_first", reason="web_only_available")
+        if self._is_realtime_query(question):
+            return PlannerDecision(next_step="web_first", reason="realtime_query")
+
+        prompt = (
+            "Classify which source should be queried first for this question.\n"
+            "Return JSON: {\"route\": \"graph_first|web_first\", \"reason\": \"...\"}.\n"
+            "Use graph_first for project/domain/internal terminology, product implementation details, "
+            "or when uncertain.\n"
+            "Use web_first only for clearly real-time/public internet questions.\n\n"
+            f"Question:\n{question}\n"
+        )
+        try:
+            structured_model = self.model.with_structured_output(_RouteOutput)
+            out = structured_model.invoke([HumanMessage(content=prompt)])
+            if isinstance(out, _RouteOutput):
+                return PlannerDecision(next_step=out.route, reason=out.reason or "model_router")
+            if isinstance(out, dict):
+                route = str(out.get("route", "")).strip().lower()
+                if route in {"graph_first", "web_first"}:
+                    return PlannerDecision(next_step=route, reason=str(out.get("reason", "") or "model_router"))
+        except Exception:
+            pass
+
+        return PlannerDecision(next_step="graph_first", reason="default_local_first")
+
+    def _router_node(self, state: AgentState) -> Dict[str, Any]:
+        question = str(state.get("question", "")).strip()
+        decision = self._route_question(question)
+
+        updates: Dict[str, Any] = {
+            "route_hint": decision.next_step,
+            "planning_meta": {
+                "next_step": "plan",
+                "reason": f"router:{decision.reason}",
+            },
+        }
+
+        if decision.next_step == "graph_first" and self.toolset.graph_tool:
+            call = self._tool_call("graph_search", {"query": question, "limit": 12})
+            planned_calls = list(state.get("planned_calls") or [])
+            planned_calls.append({"tool_name": "graph_search", "arguments": {"query": question, "limit": 12}})
+            updates.update(
+                {
+                    "messages": [AIMessage(content="Starting with local graph search.", tool_calls=[call])],
+                    "planned_calls": planned_calls,
+                    "planning_meta": {
+                        "next_step": "tools",
+                        "reason": "router_graph_first",
+                        "planned_calls": [{"tool_name": "graph_search", "arguments": {"query": question, "limit": 12}}],
+                    },
+                }
+            )
+
+        return updates
+
+    @staticmethod
+    def _route_after_router(state: AgentState) -> str:
+        messages = list(state.get("messages") or [])
+        if messages:
+            last = messages[-1]
+            if isinstance(last, AIMessage) and list(getattr(last, "tool_calls", []) or []):
+                return "tool_node"
+        return "plan_node"
+
     def _plan_node(self, state: AgentState) -> Dict[str, Any]:
         messages = list(state.get("messages") or [HumanMessage(content=state.get("question", ""))])
-        ai = self.model_with_tools.invoke(messages)
+        route_hint = str(state.get("route_hint", "")).strip().lower()
+        tool_names = ", ".join(tool.name for tool in self.toolset.tools)
+        planner_policy = (
+            "You are a tool planner.\n"
+            "Policy:\n"
+            "- Prefer graph_search first for project/domain knowledge and implementation questions.\n"
+            "- Use web_search first only for clearly real-time/public internet questions "
+            "(latest/current/today/news/weather/markets).\n"
+            "- If unsure, choose graph_search first.\n"
+            f"Router hint: {route_hint or 'none'}.\n"
+            f"Available tools: {tool_names}.\n"
+        )
+        ai = self.model_with_tools.invoke([SystemMessage(content=planner_policy), *messages])
         if not isinstance(ai, AIMessage):
             ai = AIMessage(content=self._coerce_content_to_text(getattr(ai, "content", ai)))
 
         raw_calls = list(getattr(ai, "tool_calls", []) or [])
         tool_calls = raw_calls[: self.max_tool_calls]
+        if route_hint == "graph_first" and self.toolset.graph_tool:
+            has_graph_call = any(str(call.get("name", "")).strip() == "graph_search" for call in tool_calls)
+            if not has_graph_call:
+                tool_calls = [self._tool_call("graph_search", {"query": str(state.get("question", "")), "limit": 12})]
         if tool_calls != raw_calls:
             ai = AIMessage(content=ai.content, tool_calls=tool_calls)
 
@@ -306,7 +431,7 @@ class StateGraphKnowledgeAgent:
                 title = str(data.get("tool") or tool_name)
                 sources.append(SourceRef(title=title, url=url))
 
-            if tool_name == "fetch_content":
+            if is_fetch_content_tool(tool_name):
                 url = str(arguments.get("url", "")).strip()
                 if url:
                     fetched_urls.add(url)
@@ -343,8 +468,16 @@ class StateGraphKnowledgeAgent:
         except Exception:
             pass
 
-        has_graph = any(row.tool_name == "graph_search" for row in tool_trace)
-        has_web = any(row.tool_name == "web_search" for row in tool_trace)
+        has_graph = any(
+            row.tool_name == "graph_search" or row.tool_name.endswith(".graph_search")
+            for row in tool_trace
+        )
+        has_web = any(
+            row.tool_name == "web_search" or is_web_search_tool(row.tool_name)
+            for row in tool_trace
+        )
+        if has_graph and not has_web:
+            return CompletenessDecision(is_complete=True, reason="heuristic_graph_only")
         return CompletenessDecision(is_complete=has_graph and has_web, reason="heuristic")
 
     def _plan_followup_query(self, question: str, tool_trace: List[ToolTraceEntry]) -> str:
@@ -572,6 +705,7 @@ class StateGraphKnowledgeAgent:
     def answer(self, question: str) -> StateGraphAgentResult:
         initial_state: AgentState = {
             "question": question,
+            "route_hint": "",
             "messages": [HumanMessage(content=question)],
             "tool_trace": [],
             "sources": [],

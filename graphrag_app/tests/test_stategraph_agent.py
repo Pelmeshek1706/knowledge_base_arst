@@ -94,7 +94,8 @@ class StateGraphAgentTests(unittest.TestCase):
         )
         result = agent.answer("What is in project docs?")
         self.assertIn("Final answer", result.answer)
-        self.assertEqual(result.executed_results, [])
+        self.assertEqual(len(result.executed_results), 1)
+        self.assertEqual(result.executed_results[0].tool_name, "graph_search")
 
     def test_research_gate_treats_namespaced_web_tool_as_web(self) -> None:
         agent = StateGraphKnowledgeAgent(
@@ -126,6 +127,18 @@ class StateGraphAgentTests(unittest.TestCase):
             }
         )
         self.assertEqual(updates["planning_meta"]["next_step"], "deep_fetch")
+
+    def test_router_prefers_web_for_realtime_query(self) -> None:
+        agent = StateGraphKnowledgeAgent(
+            model=_FakeModel(),
+            tool_registry=_FakeRegistryWithWeb(),
+            allowed_tools=["graph_search", "duckduckgo.search", "duckduckgo.fetch_content"],
+            web_budget=2,
+            max_deep_links=1,
+            max_research_iterations=2,
+        )
+        decision = agent._route_question("latest weather forecast in Kyiv today")
+        self.assertEqual(decision.next_step, "web_first")
 
 
 if __name__ == "__main__":

@@ -50,6 +50,7 @@ class AgentPlanningMeta(TypedDict, total=False):
 class AgentState(TypedDict, total=False):
     messages: Annotated[List[AnyMessage], add_messages]
     question: str
+    route_hint: str
     tool_trace: List[ToolTraceEntry]
     sources: List[SourceRef]
     web_budget: int
