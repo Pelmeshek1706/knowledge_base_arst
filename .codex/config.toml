@@ -1,9 +1,0 @@
-[agents]
-max_threads = 3
-max_depth = 1
-
-[workflow]
-requires_user_approval_before_developer = true
-single_developer_task_per_run = true
-qa_required_after_each_task = true
-no_automatic_continuation = true
