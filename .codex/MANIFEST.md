@@ -12,7 +12,7 @@
 
 - `skills/tech-lead-planning/`
 - `skills/tech-lead-documentation/`
-- skills/implement-personal-kb-roadmap/
+- `skills/implement-personal-kb-roadmap/`
 - `skills/ai-ml-quality-assurance/`
 
 ## Prompts
