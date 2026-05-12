@@ -146,7 +146,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-002`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Shared schemas, config, and core utility foundations
 - Roadmap Phase(s): Phase 1
 - Goal: Implement the typed config, schema, path, hashing, normalization, ID,
