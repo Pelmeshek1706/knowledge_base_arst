@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from pydantic import Field
@@ -12,6 +13,41 @@ from personal_kb.schemas.document import (
     SourceType,
     SupportedFileExtension,
 )
+from personal_kb.schemas.relationships import RelationshipType
+
+
+class ProcessingAction(str, Enum):
+    SKIP = "SKIP"
+    PROCESS_NEW = "PROCESS_NEW"
+    NEWER_VERSION_OF = "NEWER_VERSION_OF"
+    DUPLICATE_OF = "DUPLICATE_OF"
+    RETRY_FAILED = "RETRY_FAILED"
+
+
+class DiscoveredFile(SchemaBaseModel):
+    document_id: str
+    source_id: str
+    source_type: SourceType = "local_file"
+    file_path: str
+    file_name: str
+    file_extension: SupportedFileExtension
+    raw_bytes_hash: str
+    size_bytes: int | None = None
+    modified_at: datetime | None = None
+
+
+class ProcessingDecision(SchemaBaseModel):
+    candidate: DiscoveredFile
+    action: ProcessingAction
+    reason: str
+    matched_document_id: str | None = None
+    related_document_id: str | None = None
+    relationship_type: RelationshipType | None = None
+    retry_allowed: bool = False
+
+
+class ProcessingPlan(SchemaBaseModel):
+    decisions: list[ProcessingDecision] = Field(default_factory=list)
 
 
 class ProcessingMetadata(SchemaBaseModel):

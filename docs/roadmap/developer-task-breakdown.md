@@ -224,7 +224,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-003`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Manifest store and processed document store
 - Roadmap Phase(s): Phase 1
 - Goal: Implement durable JSON persistence for the manifest and per-document
@@ -282,7 +282,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-004`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Local discovery, hashing, duplicate detection, and planning
 - Roadmap Phase(s): Phase 2
 - Goal: Implement supported-file discovery plus deterministic pre-parse

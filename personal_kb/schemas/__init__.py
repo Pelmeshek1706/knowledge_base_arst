@@ -31,6 +31,12 @@ from personal_kb.schemas.document import (
 from personal_kb.schemas.entity import EntityRecord, EntityType
 from personal_kb.schemas.manifest import Manifest, ManifestDocumentEntry, ProcessingStatus
 from personal_kb.schemas.processing import ProcessingMetadata, ProcessedDocument
+from personal_kb.schemas.processing import (
+    DiscoveredFile,
+    ProcessingAction,
+    ProcessingDecision,
+    ProcessingPlan,
+)
 from personal_kb.schemas.qa import AnswerQuestionRequest, AnswerQuestionResponse, SourceDocumentRef
 from personal_kb.schemas.relationships import DocumentRelationship, RelationshipType
 from personal_kb.schemas.search import (
