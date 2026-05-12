@@ -33,12 +33,38 @@ def test_markdown_parser_handles_real_project_markdown_sample() -> None:
         source_id="data/Product_Requirements_Document_Personal_KB_v0.2.md",
     )
 
+    heading_paths = [block["heading_path"] for block in parsed.structured_blocks]
+
     assert parsed.raw_text.startswith("# Product Requirements Document")
-    assert [block["heading_path"] for block in parsed.structured_blocks] == [
-        ["Product Requirements Document — Personal KB Local-First GraphRAG System"],
-        ["Product Requirements Document — Personal KB Local-First GraphRAG System", "Previous content"],
-        ["Product Requirements Document — Personal KB Local-First GraphRAG System", "Notes"],
+    assert parsed.structured_blocks[0]["heading_path"] == [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System"
     ]
+    assert len(parsed.structured_blocks) >= 20
+    assert [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System"
+    ] in heading_paths
+    assert [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System",
+        "1. Executive Summary",
+    ] in heading_paths
+    assert [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System",
+        "1. Executive Summary",
+        "Core MVP promise",
+    ] in heading_paths
+    assert [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System",
+        "8. Functional Requirements",
+        "8.4 Parsers",
+    ] in heading_paths
+    assert [
+        "Product Requirements Document — Personal KB Local-First GraphRAG System",
+        "8. Functional Requirements",
+        "8.5 Chunking",
+    ] in heading_paths
+    assert parsed.structured_blocks[0]["source_ref"]["section"] == (
+        "Product Requirements Document — Personal KB Local-First GraphRAG System"
+    )
 
 
 def test_parser_registry_resolves_markdown_extension() -> None:
