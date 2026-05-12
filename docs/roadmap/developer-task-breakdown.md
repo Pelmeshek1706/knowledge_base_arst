@@ -1,6 +1,6 @@
 # Developer Task Breakdown
 
-Plan Status: `PENDING_USER_APPROVAL`
+Plan Status: `IN_PROGRESS`
 
 ## Purpose
 
@@ -9,11 +9,21 @@ one-task-at-a-time implementation backlog for the AI/ML Python Engineer.
 
 Rules for execution:
 
-- Every task below is `PENDING_USER_APPROVAL`.
+- Tasks start as `PENDING_USER_APPROVAL` and move forward one at a time.
 - Only one task may be handed off at a time after explicit approval.
 - After each implementation task, QA must run before the next task starts.
 - If a task hits a documented stop condition, the engineer must stop and ask
   the Tech Lead or user rather than inventing project policy.
+
+Allowed task statuses:
+
+- `PENDING_USER_APPROVAL`
+- `APPROVED_FOR_IMPLEMENTATION`
+- `IN_PROGRESS`
+- `READY_FOR_QA`
+- `QA_FAILED`
+- `QA_PASSED`
+- `DONE`
 
 ## Current Repo State
 
@@ -64,7 +74,7 @@ Rules for execution:
 
 ### Task ID: `TL-001`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Project bootstrap and repository scaffolding
 - Roadmap Phase(s): Phase 0
 - Goal: Create the initial `personal_kb/` package skeleton, baseline project
@@ -1284,5 +1294,6 @@ Rules for execution:
 
 ## Approval Request
 
-Approve this plan before implementation starts. After approval, I will hand off
-only Task `TL-001` to the Python Engineer.
+This plan is approved and currently in progress. `TL-001` has been implemented
+and passed QA. The next implementation handoff still requires explicit approval
+before handing off only Task `TL-002` to the Python Engineer.

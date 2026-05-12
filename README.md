@@ -6,10 +6,12 @@
 
 Current repository status:
 
-- This repository is currently a roadmap and implementation workspace.
+- This repository is still a roadmap and implementation workspace, but the
+  Phase 0 bootstrap scaffold is now checked in.
 - The authoritative project package name in the docs is `personal_kb`.
-- `pyproject.toml` currently uses the project name `knowledge-agent`; this should be aligned during bootstrap.
-- `README.md` is being added before the main `personal_kb/` package exists.
+- `pyproject.toml` uses the project name `personal-kb` and installs the `kb` console script.
+- `README.md` documents the current bootstrap scaffold and the remaining
+  roadmap work.
 - The CLI commands described below are planned MVP commands, not currently implemented unless noted otherwise.
 
 Use this README as the starting point before development, then follow the focused source-of-truth docs under [`docs/`](docs/index.md).
@@ -31,7 +33,9 @@ The planned MVP will:
 - expose search and Q&A through an `argparse` CLI;
 - expose the same search and Q&A capabilities to a LangGraph agent through LangChain `StructuredTool` wrappers.
 
-Current implementation note: the repository does not yet contain the planned `personal_kb/` source package, test suite, or `kb` console script.
+Current implementation note: the repository already includes the planned
+`personal_kb/` source package, test suite, `kb` console script, `.env.example`,
+and `configs/default.yaml` scaffold.
 
 ## MVP Scope
 
@@ -203,10 +207,10 @@ uv sync
 Create a local environment file:
 
 ```bash
-cp env_sample .env
+cp .env.example .env
 ```
 
-`env_sample` is the current environment template. The architecture docs expect a future `.env.example`; until that exists, use `env_sample`.
+`.env.example` is the current environment template.
 
 Create planned runtime folders if they are missing:
 
@@ -243,7 +247,8 @@ Current mismatch to resolve during bootstrap:
 
 - `env_sample` uses legacy names such as `NEO4J_USER`, `LMSTUDIO_URL`, and `LMSTUDIO_MODEL`.
 - The focused architecture docs use `NEO4J_USERNAME`, `LM_STUDIO_BASE_URL`, and `LM_STUDIO_MODEL`.
-- No `configs/` directory or `.env.example` file exists yet.
+- `configs/default.yaml` and `.env.example` are now part of the checked-in
+  bootstrap scaffold, and `env_sample` remains the legacy template to reconcile.
 
 Do not commit `.env`, real credentials, source documents, generated `kb_storage/` content, or local Neo4j volumes.
 
@@ -434,11 +439,13 @@ First sprint acceptance criteria:
 
 Known current limitations:
 
-- `personal_kb/` does not exist yet.
-- `tests/`, `benchmark/`, `kb_storage/`, `configs/`, and `scripts/` are not fully present yet.
-- `pyproject.toml` project metadata is not aligned with the documented package name.
+- `personal_kb/`, `tests/`, `benchmark/`, `kb_storage/`, `configs/`, and
+  `.env.example` are part of the bootstrap scaffold; later package layers and
+  runtime behavior still need implementation.
+- `scripts/` is not yet fully populated for the later roadmap phases.
+- `pyproject.toml` project metadata now owns the bootstrap validation stack, but
+  later roadmap dependencies still need to be added incrementally.
 - `env_sample` reflects a legacy demo configuration and must be reconciled with the MVP configuration contract.
-- `.env.example` is expected by docs but does not exist yet.
 - The current `.gitignore` is minimal and should be expanded before runtime data is generated.
 - Neo4j database availability and database-name fallback need validation during implementation.
 - Local model output quality, JSON validity, and latency are major MVP risks.

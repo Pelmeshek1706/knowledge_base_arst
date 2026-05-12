@@ -1,0 +1,19 @@
+project:
+  name: personal_kb
+  config_path: configs/default.yaml
+
+storage:
+  data_dir: data
+  kb_storage_dir: kb_storage
+  benchmark_dir: benchmark
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: change-me
+  database: knowledge_base3
+  fallback_database: neo4j
+
+lm_studio:
+  base_url: http://localhost:1234/v1
+  model: mlx-community/Qwen3.5-9B-OptiQ-4bit

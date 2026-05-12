@@ -1,8 +1,16 @@
-/data/*
-./venv
+data/*
+!data/.gitkeep
+kb_storage/*
+!kb_storage/.gitkeep
+.venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .DS_Store
 .env
 
 ./staff.ipynb
+.codex/*
