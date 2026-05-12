@@ -22,11 +22,11 @@ class ManifestDocumentEntry(SchemaBaseModel):
     document_id: str
     source_id: str
     file_path: str
-    file_name: str
-    file_extension: str
-    raw_bytes_hash: str
+    file_name: str | None = None
+    file_extension: str | None = None
+    raw_bytes_hash: str | None = None
     extracted_text_hash: str | None = None
-    content_hash: str
+    content_hash: str | None = None
     processed_json_path: str | None = None
     ingested_at: datetime | None = None
     modified_at: datetime | None = None
@@ -42,10 +42,20 @@ class ManifestDocumentEntry(SchemaBaseModel):
     def _validate_status_dependent_fields(self) -> "ManifestDocumentEntry":
         if self.status == "failed" and not self.error_message:
             raise ValueError("error_message is required when status='failed'")
-        if self.status in {"processed", "synced", "duplicate", "versioned"} and not self.processed_json_path:
-            raise ValueError(
-                "processed_json_path is required when status indicates processed data"
-            )
+        if self.status in {"processed", "synced", "duplicate", "versioned"}:
+            required_fields = {
+                "file_name": self.file_name,
+                "file_extension": self.file_extension,
+                "raw_bytes_hash": self.raw_bytes_hash,
+                "content_hash": self.content_hash,
+                "processed_json_path": self.processed_json_path,
+            }
+            missing_fields = [name for name, value in required_fields.items() if not value]
+            if missing_fields:
+                raise ValueError(
+                    "missing required processed-document fields: "
+                    + ", ".join(missing_fields)
+                )
         return self
 
 
