@@ -344,7 +344,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-005`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: TXT and Markdown parsing plus first chunking slice
 - Roadmap Phase(s): Phases 3-4
 - Goal: Implement the simplest supported file types first: TXT and Markdown
