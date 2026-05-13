@@ -451,6 +451,15 @@ Known current limitations:
 - Local model output quality, JSON validity, and latency are major MVP risks.
 - Retrieval quality must be benchmarked early; it should not be judged only by ad hoc prompts.
 
+## TODO
+
+Future chunking work:
+
+- The current PDF, DOCX, and XLSX chunking is an MVP baseline focused on deterministic behavior and stable source references.
+- PDF chunking currently uses page-aware splitting, and oversized sections in PDF and DOCX still fall back to character-window splitting.
+- Chunk quality should be improved in a later phase through additional research, evaluation on real project documents, and format-specific strategies such as paragraph-aware, sentence-aware, block-aware, or table-aware splitting where appropriate.
+- Chunking changes should be validated against retrieval, citation quality, and downstream extraction results instead of only parser or unit-test behavior.
+
 ## License
 
 No license file is present. Treat the repository as unlicensed until the owner adds an explicit license.
