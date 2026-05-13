@@ -54,8 +54,32 @@ class ExtractionError(PersonalKBError):
     """Raised when model-based extraction fails."""
 
 
+class ModelClientError(PersonalKBError):
+    """Raised when a model client cannot satisfy a request."""
+
+
+class ModelProviderUnavailableError(ModelClientError):
+    """Raised when a local model provider or runtime cannot be loaded."""
+
+
+class ModelOutputContractError(ModelClientError):
+    """Raised when a provider returns data that violates a typed contract."""
+
+
+class LLMError(ModelClientError):
+    """Raised when LLM generation fails."""
+
+
+class StructuredOutputError(LLMError):
+    """Raised when structured output cannot be parsed or validated."""
+
+
 class EmbeddingError(PersonalKBError):
     """Raised when embedding generation fails."""
+
+
+class RerankerError(ModelClientError):
+    """Raised when reranking or reranker scoring fails."""
 
 
 class GraphSyncError(PersonalKBError):
@@ -72,4 +96,3 @@ class QAError(PersonalKBError):
 
 class ToolExecutionError(PersonalKBError):
     """Raised when a tool-facing action fails."""
-

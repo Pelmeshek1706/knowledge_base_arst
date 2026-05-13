@@ -1,6 +1,7 @@
 project:
   name: personal_kb
   config_path: configs/default.yaml
+  path_mode: relative
 
 storage:
   data_dir: data
@@ -14,6 +15,33 @@ neo4j:
   database: knowledge_base3
   fallback_database: neo4j
 
-lm_studio:
-  base_url: http://localhost:1234/v1
-  model: mlx-community/Qwen3.5-9B-OptiQ-4bit
+models:
+  llm:
+    provider: lmstudio_openai_compatible
+    base_url: http://localhost:1234/v1
+    api_key: lm-studio
+    model_name: mlx-qwen3.5-9b-claude-4.6-opus-reasoning-distilled-v2
+    runtime: mlx-lm
+    quantization: mixed_precision_4bit
+    role: production_default
+    default_thinking_mode: non_thinking
+    structured_output_retries: 2
+    timeout_seconds: 60.0
+  embedding:
+    provider: local
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    dimension: 1024
+    context_length: 32768
+    normalize_embeddings: true
+    instruction_aware: true
+    store_full_vectors_in_json: true
+  reranker:
+    provider: local
+    model_name: Qwen/Qwen3-Reranker-0.6B
+    context_length: 32768
+    top_k_before_rerank: 50
+    top_k_after_rerank: 8
+    instruction_aware: true
+
+normalization:
+  tag_entity_normalization: lowercase_trim_collapse_spaces

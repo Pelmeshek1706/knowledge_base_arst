@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from pydantic import Field
 
 from personal_kb.schemas.common import SchemaBaseModel
 from personal_kb.schemas.search import ScoreMode
+
+
+LLMThinkingMode: TypeAlias = Literal["default", "thinking", "non_thinking"]
 
 
 class ProjectConfig(SchemaBaseModel):
@@ -34,10 +37,14 @@ class Neo4jConfig(SchemaBaseModel):
 class LLMConfig(SchemaBaseModel):
     provider: str = "lmstudio_openai_compatible"
     base_url: str = "http://localhost:1234/v1"
-    model_name: str = "mlx-community/Qwen3.5-9B-OptiQ-4bit"
+    api_key: str = "lm-studio"
+    model_name: str = "mlx-qwen3.5-9b-claude-4.6-opus-reasoning-distilled-v2"
     runtime: str = "mlx-lm"
     quantization: str = "mixed_precision_4bit"
     role: str = "production_default"
+    default_thinking_mode: LLMThinkingMode = "non_thinking"
+    structured_output_retries: int = Field(default=2, ge=0)
+    timeout_seconds: float = Field(default=60.0, gt=0)
 
 
 class EmbeddingConfig(SchemaBaseModel):
@@ -98,4 +105,3 @@ class AppConfig(SchemaBaseModel):
 
 
 PersonalKBConfig = AppConfig
-

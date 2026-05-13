@@ -21,7 +21,9 @@ _LEGACY_ENV_TO_PATHS: dict[str, tuple[str, ...]] = {
     "NEO4J_DATABASE": ("neo4j", "database"),
     "NEO4J_FALLBACK_DATABASE": ("neo4j", "fallback_database"),
     "LMSTUDIO_URL": ("models", "llm", "base_url"),
+    "LM_STUDIO_BASE_URL": ("models", "llm", "base_url"),
     "LMSTUDIO_MODEL": ("models", "llm", "model_name"),
+    "LM_STUDIO_MODEL": ("models", "llm", "model_name"),
     "LMSTUDIO_EMBED_MODEL": ("models", "embedding", "model_name"),
     "LOCAL_EMBED_DIMENSIONS": ("models", "embedding", "dimension"),
 }
@@ -39,10 +41,26 @@ _PREFERRED_ENV_TO_PATHS: dict[str, tuple[str, ...]] = {
     "PERSONAL_KB_NEO4J_FALLBACK_DATABASE": ("neo4j", "fallback_database"),
     "PERSONAL_KB_MODEL_LLM_PROVIDER": ("models", "llm", "provider"),
     "PERSONAL_KB_MODEL_LLM_BASE_URL": ("models", "llm", "base_url"),
+    "PERSONAL_KB_MODEL_LLM_API_KEY": ("models", "llm", "api_key"),
     "PERSONAL_KB_MODEL_LLM_MODEL_NAME": ("models", "llm", "model_name"),
     "PERSONAL_KB_MODEL_LLM_RUNTIME": ("models", "llm", "runtime"),
     "PERSONAL_KB_MODEL_LLM_QUANTIZATION": ("models", "llm", "quantization"),
     "PERSONAL_KB_MODEL_LLM_ROLE": ("models", "llm", "role"),
+    "PERSONAL_KB_MODEL_LLM_DEFAULT_THINKING_MODE": (
+        "models",
+        "llm",
+        "default_thinking_mode",
+    ),
+    "PERSONAL_KB_MODEL_LLM_STRUCTURED_OUTPUT_RETRIES": (
+        "models",
+        "llm",
+        "structured_output_retries",
+    ),
+    "PERSONAL_KB_MODEL_LLM_TIMEOUT_SECONDS": (
+        "models",
+        "llm",
+        "timeout_seconds",
+    ),
     "PERSONAL_KB_MODEL_EMBEDDING_PROVIDER": ("models", "embedding", "provider"),
     "PERSONAL_KB_MODEL_EMBEDDING_MODEL_NAME": ("models", "embedding", "model_name"),
     "PERSONAL_KB_MODEL_EMBEDDING_DIMENSION": ("models", "embedding", "dimension"),
@@ -116,6 +134,7 @@ class ConfigLoader:
     def _normalize_config(
         self, raw_config: dict[str, object], config_path: Path
     ) -> dict[str, object]:
+        models_source = self._as_dict(raw_config.get("models"))
         project = self._as_dict(raw_config.get("project"))
         project.setdefault("name", "personal_kb")
         project.setdefault("config_path", self._relativize(config_path))
@@ -133,23 +152,38 @@ class ConfigLoader:
         neo4j.setdefault("database", "knowledge_base3")
         neo4j.setdefault("fallback_database", "neo4j")
 
-        llm_source = self._as_dict(raw_config.get("llm"))
+        llm_source = self._as_dict(models_source.get("llm"))
+        if not llm_source:
+            llm_source = self._as_dict(raw_config.get("llm"))
         lm_studio = self._as_dict(raw_config.get("lm_studio"))
         llm = {
             "provider": llm_source.get("provider", "lmstudio_openai_compatible"),
             "base_url": llm_source.get(
                 "base_url", lm_studio.get("base_url", "http://localhost:1234/v1")
             ),
+            "api_key": llm_source.get("api_key", "lm-studio"),
             "model_name": llm_source.get(
                 "model_name",
-                lm_studio.get("model", "mlx-community/Qwen3.5-9B-OptiQ-4bit"),
+                lm_studio.get(
+                    "model",
+                    "mlx-qwen3.5-9b-claude-4.6-opus-reasoning-distilled-v2",
+                ),
             ),
             "runtime": llm_source.get("runtime", "mlx-lm"),
             "quantization": llm_source.get("quantization", "mixed_precision_4bit"),
             "role": llm_source.get("role", "production_default"),
+            "default_thinking_mode": llm_source.get(
+                "default_thinking_mode", "non_thinking"
+            ),
+            "structured_output_retries": llm_source.get(
+                "structured_output_retries", 2
+            ),
+            "timeout_seconds": llm_source.get("timeout_seconds", 60.0),
         }
 
-        embedding_source = self._as_dict(raw_config.get("embedding"))
+        embedding_source = self._as_dict(models_source.get("embedding"))
+        if not embedding_source:
+            embedding_source = self._as_dict(raw_config.get("embedding"))
         embedding = {
             "provider": embedding_source.get("provider", "local"),
             "model_name": embedding_source.get(
@@ -164,7 +198,9 @@ class ConfigLoader:
             ),
         }
 
-        reranker_source = self._as_dict(raw_config.get("reranker"))
+        reranker_source = self._as_dict(models_source.get("reranker"))
+        if not reranker_source:
+            reranker_source = self._as_dict(raw_config.get("reranker"))
         reranker = {
             "provider": reranker_source.get("provider", "local"),
             "model_name": reranker_source.get(

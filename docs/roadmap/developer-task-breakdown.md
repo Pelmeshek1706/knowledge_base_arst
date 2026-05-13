@@ -408,7 +408,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-006`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: PDF, DOCX, and XLSX parsing plus advanced chunking
 - Roadmap Phase(s): Phases 3-4
 - Goal: Implement the remaining MVP parsers and chunkers, including page,
