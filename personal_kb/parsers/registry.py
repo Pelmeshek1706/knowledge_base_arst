@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from personal_kb.parsers.base import BaseParser
+from personal_kb.parsers.docx_parser import DocxParser
 from personal_kb.parsers.markdown_parser import MarkdownParser
+from personal_kb.parsers.pdf_parser import PdfParser
+from personal_kb.parsers.xlsx_parser import XlsxParser
 from personal_kb.parsers.txt_parser import TxtParser
 
 
@@ -20,6 +23,9 @@ class ParserRegistry:
         except KeyError as exc:
             raise ValueError(f"unsupported parser extension: {extension}") from exc
 
+    def is_supported(self, extension: str) -> bool:
+        return self._normalize_extension(extension) in self._parsers
+
     @staticmethod
     def _normalize_extension(extension: str) -> str:
         return extension.lower().lstrip(".")
@@ -29,4 +35,7 @@ def build_default_parser_registry() -> ParserRegistry:
     registry = ParserRegistry()
     registry.register(TxtParser())
     registry.register(MarkdownParser())
+    registry.register(PdfParser())
+    registry.register(DocxParser())
+    registry.register(XlsxParser())
     return registry

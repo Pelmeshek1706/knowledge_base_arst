@@ -19,7 +19,7 @@ class MarkdownParser(BaseParser):
 
         return ParsedDocument(
             source_id=normalized_source_id,
-            file_path=file_path.as_posix(),
+            file_path=normalized_source_id,
             file_name=file_path.name,
             file_extension="md",
             title=file_path.stem,
