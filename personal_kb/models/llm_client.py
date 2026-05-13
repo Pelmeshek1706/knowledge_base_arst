@@ -51,6 +51,17 @@ class LLMTextResponse(SchemaBaseModel):
     reasoning_content: str | None = None
     metadata: LLMResponseMetadata
 
+    @property
+    def transcript(self) -> str:
+        parts: list[str] = []
+        for part in (self.reasoning_content, self.content):
+            if part is None:
+                continue
+            stripped = part.strip()
+            if stripped:
+                parts.append(stripped)
+        return "\n\n".join(parts)
+
 
 @dataclass(slots=True)
 class StructuredLLMResult(Generic[SchemaT]):

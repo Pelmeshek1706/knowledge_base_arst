@@ -7,7 +7,11 @@ import pytest
 from pydantic import BaseModel
 
 from personal_kb.core.errors import StructuredOutputError
-from personal_kb.models.llm_client import LLMClient
+from personal_kb.models.llm_client import (
+    LLMClient,
+    LLMResponseMetadata,
+    LLMTextResponse,
+)
 from personal_kb.schemas.config import LLMConfig
 
 
@@ -73,6 +77,22 @@ def _response_payload(
     }
 
 
+def _text_response(
+    *,
+    content: str,
+    reasoning_content: str | None = None,
+) -> LLMTextResponse:
+    return LLMTextResponse(
+        content=content,
+        reasoning_content=reasoning_content,
+        metadata=LLMResponseMetadata(
+            provider="lmstudio_openai_compatible",
+            model_name="stub-model",
+            thinking_mode_requested="non_thinking",
+        ),
+    )
+
+
 def test_generate_text_defaults_to_non_thinking_and_surfaces_reasoning() -> None:
     fake_client = FakeClient(
         [
@@ -116,6 +136,48 @@ def test_generate_text_supports_explicit_thinking_mode() -> None:
     assert response.metadata.thinking_mode_requested == "thinking"
     assert response.metadata.thinking_mode_defaulted is False
     assert response.metadata.provider_honored_non_thinking_request is None
+
+
+def test_llm_text_response_transcript_includes_reasoning_before_answer() -> None:
+    response = _text_response(
+        content="Final answer",
+        reasoning_content="Reasoning trace",
+    )
+
+    assert response.transcript == "Reasoning trace\n\nFinal answer"
+
+
+def test_llm_text_response_transcript_returns_only_final_answer_when_present() -> None:
+    response = _text_response(content="Final answer only")
+
+    assert response.transcript == "Final answer only"
+
+
+def test_llm_text_response_transcript_returns_only_reasoning_when_present() -> None:
+    response = _text_response(content="", reasoning_content="Reasoning only")
+
+    assert response.transcript == "Reasoning only"
+
+
+def test_generate_text_keeps_content_and_reasoning_fields_separate() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="Final answer",
+                reasoning_content="Hidden chain",
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(),
+        client_factory=lambda config: fake_client,
+    )
+
+    response = client.generate_text("Explain the result")
+
+    assert response.content == "Final answer"
+    assert response.reasoning_content == "Hidden chain"
+    assert response.transcript == "Hidden chain\n\nFinal answer"
 
 
 def test_generate_json_retries_invalid_structured_output() -> None:
