@@ -9,6 +9,7 @@ from personal_kb.core.errors import ExtractionError, StructuredOutputError
 from personal_kb.extraction.structured_extractor import (
     ChunkExtractionPayload,
     DocumentSummaryPayload,
+    ExtractedEntityPayload,
     StructuredExtractor,
 )
 from personal_kb.models.llm_client import (
@@ -129,14 +130,19 @@ def _provider_response_payload(*, content: str, reasoning_content: str) -> dict[
     }
 
 
-def test_chunk_extraction_payload_schema_requires_summary_and_tags() -> None:
+def test_chunk_extraction_payload_schema_requires_summary_tags_and_entities() -> None:
     schema = ChunkExtractionPayload.model_json_schema()
 
-    assert schema["required"] == ["summary", "tags"]
+    assert schema["required"] == ["summary", "tags", "entities"]
     assert schema["additionalProperties"] is False
     assert schema["properties"]["summary"]["type"] == "string"
     assert schema["properties"]["tags"]["type"] == "array"
     assert schema["properties"]["tags"]["items"]["type"] == "string"
+    assert schema["properties"]["entities"]["type"] == "array"
+    entity_schema = schema["$defs"]["ExtractedEntityPayload"]
+    assert entity_schema["required"] == ["name", "type"]
+    assert entity_schema["properties"]["name"]["type"] == "string"
+    assert entity_schema["properties"]["type"]["type"] == "string"
     assert "retrieval tag strings" in schema["properties"]["tags"]["description"]
 
 
@@ -147,12 +153,20 @@ def test_structured_extractor_retries_blank_summary_and_uses_non_thinking() -> N
                 ChunkExtractionPayload(
                     summary="   ",
                     tags=["Roadmap Budget"],
+                    entities=[],
                 )
             ),
             _result(
                 ChunkExtractionPayload(
                     summary="Alice reviews the roadmap budget.",
                     tags=["Roadmap Budget"],
+                    entities=[
+                        ExtractedEntityPayload(
+                            name="Alice",
+                            type="Person",
+                            confidence=0.96,
+                        )
+                    ],
                 )
             ),
         ]
@@ -166,7 +180,9 @@ def test_structured_extractor_retries_blank_summary_and_uses_non_thinking() -> N
     assert result.tags[0].name == "Roadmap Budget"
     assert result.tags[0].normalized_name == "roadmap budget"
     assert result.tags[0].confidence is None
-    assert result.entities == []
+    assert [(entity.name, entity.normalized_name, entity.type) for entity in result.entities] == [
+        ("Alice", "alice", "Person")
+    ]
     assert llm_client.calls[0]["thinking_mode"] == "non_thinking"
     assert "Return only valid JSON" in llm_client.calls[0]["system_prompt"]
     assert "Additional validator feedback" in llm_client.calls[1]["prompt"]
@@ -186,6 +202,7 @@ def test_structured_extractor_cleans_blank_and_duplicate_tag_strings() -> None:
                         "   ",
                         "NEO4J",
                     ],
+                    entities=[],
                 )
             )
         ]
@@ -205,6 +222,40 @@ def test_structured_extractor_cleans_blank_and_duplicate_tag_strings() -> None:
     ]
 
 
+def test_structured_extractor_deduplicates_entities_by_type_and_normalized_name() -> None:
+    llm_client = FakeLLMClient(
+        results=[
+            _result(
+                ChunkExtractionPayload(
+                    summary="Alice reviews the roadmap budget in Prague.",
+                    tags=["Roadmap Budget"],
+                    entities=[
+                        ExtractedEntityPayload(name=" Alice ", type="Person"),
+                        ExtractedEntityPayload(name="alice", type="Person", confidence=0.8),
+                        ExtractedEntityPayload(name="Prague", type="Topic"),
+                        ExtractedEntityPayload(name="Prague", type="Date"),
+                        ExtractedEntityPayload(name="   ", type="Topic"),
+                    ],
+                )
+            )
+        ]
+    )
+    extractor = StructuredExtractor(StructuredExtractionClient(llm_client))
+
+    result = extractor.extract_chunk_metadata(_chunk())
+
+    assert [(entity.name, entity.type) for entity in result.entities] == [
+        ("Alice", "Person"),
+        ("Prague", "Topic"),
+        ("Prague", "Date"),
+    ]
+    assert [entity.source_chunks for entity in result.entities] == [
+        [_chunk().chunk_id],
+        [_chunk().chunk_id],
+        [_chunk().chunk_id],
+    ]
+
+
 def test_structured_extractor_accepts_valid_reasoning_content_fallback() -> None:
     provider_client = FakeProviderClient(
         [
@@ -212,7 +263,9 @@ def test_structured_extractor_accepts_valid_reasoning_content_fallback() -> None
                 content="",
                 reasoning_content=(
                     '{"summary": "Alice reviews the roadmap budget.", '
-                    '"tags": ["Roadmap Budget", "Alice", "Prague"]}'
+                    '"tags": ["Roadmap Budget", "Alice", "Prague"], '
+                    '"entities": [{"name": "Alice", "type": "Person"}, '
+                    '{"name": "Prague", "type": "Topic"}]}'
                 ),
             )
         ]
@@ -230,7 +283,10 @@ def test_structured_extractor_accepts_valid_reasoning_content_fallback() -> None
 
     assert result.summary == "Alice reviews the roadmap budget."
     assert result.tags[0].normalized_name == "roadmap budget"
-    assert result.entities == []
+    assert [(entity.name, entity.type) for entity in result.entities] == [
+        ("Alice", "Person"),
+        ("Prague", "Topic"),
+    ]
     assert (
         provider_client.chat.completions.requests[0]["extra_body"][
             "chat_template_kwargs"
@@ -246,12 +302,14 @@ def test_structured_extractor_raises_clear_error_after_validator_retries() -> No
                     ChunkExtractionPayload(
                         summary="   ",
                         tags=[],
+                        entities=[],
                     )
                 ),
                 _result(
                     ChunkExtractionPayload(
                         summary="   ",
                         tags=[],
+                        entities=[],
                     )
                 ),
         ]

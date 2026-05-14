@@ -129,20 +129,35 @@ For each chunk:
 - tags
 - entities
 
-The live TL-008 extraction path asks the LLM for a minimal schema:
+The live TL-008 extraction path asks the LLM for a strict schema that keeps
+tags simple and keeps entity objects typed but minimal:
 
 ```json
 {
   "summary": "Concise grounded summary.",
-  "tags": ["LM Studio", "LangGraph", "Neo4j"]
+  "tags": ["LM Studio", "LangGraph", "Neo4j"],
+  "entities": [
+    {
+      "name": "LM Studio",
+      "type": "Technology",
+      "confidence": 0.95
+    },
+    {
+      "name": "LangGraph",
+      "type": "Technology"
+    }
+  ]
 }
 ```
 
 The extraction service maps each validated tag string into a `TagRecord` by
 trimming the model text, normalizing with lowercase + trim + collapse spaces,
 deduplicating by normalized name, setting `source` to `llm_extraction`, and
-attaching the current chunk ID in `source_chunks`. Chunk entities remain empty
-on this path until typed entity extraction has separate model evidence.
+attaching the current chunk ID in `source_chunks`. It maps each validated entity
+object into an `EntityRecord` by trimming `name`, normalizing
+`normalized_name`, generating deterministic IDs/keys, deduplicating by
+`(type, normalized_name)`, setting `source` to `llm_extraction`, and attaching
+the current chunk ID in `source_chunks`.
 
 Entity structure:
 

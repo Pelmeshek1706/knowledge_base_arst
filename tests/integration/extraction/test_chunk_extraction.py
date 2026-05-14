@@ -65,6 +65,17 @@ def test_chunk_extraction_embedding_and_document_aggregation_end_to_end() -> Non
                     "budget   review",
                     "",
                 ],
+                "entities": [
+                    {
+                        "name": "Budget Review",
+                        "type": "Topic",
+                    },
+                    {
+                        "name": "Roadmap",
+                        "type": "Project",
+                        "confidence": 0.91,
+                    },
+                ],
             },
             {
                 "summary": "The note focuses on a budget review and roadmap planning sequence.",
@@ -104,7 +115,7 @@ def test_chunk_extraction_embedding_and_document_aggregation_end_to_end() -> Non
 
     assert enriched_chunks[0].summary is not None
     assert enriched_chunks[0].tag_names == ["budget review", "roadmap"]
-    assert enriched_chunks[0].entity_names == []
+    assert enriched_chunks[0].entity_names == ["budget review", "roadmap"]
     assert embedded_chunks[0].embedding == [1.0, 0.0, 0.0]
     assert embedded_chunks[0].embedding_model == "test-embedding"
     assert embedded_chunks[0].embedding_dimension == 3
@@ -115,7 +126,10 @@ def test_chunk_extraction_embedding_and_document_aggregation_end_to_end() -> Non
         "budget review",
         "roadmap",
     ]
-    assert aggregated_document.entities == []
+    assert [(entity.normalized_name, entity.type) for entity in aggregated_document.entities] == [
+        ("budget review", "Topic"),
+        ("roadmap", "Project"),
+    ]
     assert fake_extraction_client.calls[0]["thinking_mode"] == "non_thinking"
     assert fake_extraction_client.calls[1]["thinking_mode"] == "non_thinking"
     assert backend.calls[0]["normalize_embeddings"] is False

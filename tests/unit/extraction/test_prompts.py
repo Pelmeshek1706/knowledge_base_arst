@@ -24,14 +24,16 @@ def test_chunk_extraction_prompt_is_explicit_and_json_only() -> None:
     assert "code fences" in STRICT_JSON_SYSTEM_PROMPT
     assert "<think> blocks" in STRICT_JSON_SYSTEM_PROMPT
     assert "Use only facts grounded in the provided chunk text." in prompt
-    assert "Return exactly these schema fields: `summary` and `tags`." in prompt
+    assert "Return exactly these schema fields: `summary`, `tags`, and `entities`." in prompt
     assert "names, organizations, projects, systems, tools, models" in prompt
     assert "libraries, technologies, documents, concepts, and domain terms" in prompt
+    assert "Return `entities` as typed objects with `name`, `type`, and optional" in prompt
+    assert "Person, Organization, Project, Topic" in prompt
     assert "main subject, project, product, or system" in prompt
     assert "Examples to preserve when present: Personal KB" in prompt
     assert "LM Studio, Qwen, Neo4j, LangGraph, and structured JSON" in prompt
     assert "Each tag must be a string" in prompt
-    assert "Do not return typed entities" in prompt
+    assert "Use an empty entity list only when the chunk genuinely contains no clear" in prompt
     assert "For tag-rich technical text, return useful non-empty tags." in prompt
     assert "Alice reviews the roadmap budget in Prague." in prompt
     assert '"section": "full_text"' in prompt

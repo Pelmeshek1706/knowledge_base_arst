@@ -5,13 +5,13 @@ from collections.abc import Sequence
 from pydantic import Field
 
 from personal_kb.core.errors import ExtractionError, StructuredOutputError
-from personal_kb.core.normalization import normalize_tag_name
+from personal_kb.core.normalization import normalize_entity_name, normalize_tag_name
 from personal_kb.models.structured_extraction_client import StructuredExtractionClient
 from personal_kb.schemas.chunk import ChunkRecord
 from personal_kb.schemas.common import SchemaBaseModel
 from personal_kb.schemas.config import LLMThinkingMode
 from personal_kb.schemas.document import DocumentRecord
-from personal_kb.schemas.entity import EntityRecord
+from personal_kb.schemas.entity import EntityRecord, EntityType
 from personal_kb.schemas.tag import TagRecord
 
 from personal_kb.extraction.aggregation import DocumentMetadataAggregator
@@ -38,6 +38,23 @@ class ChunkExtractionPayload(SchemaBaseModel):
             "technologies, documents, concepts, and domain terms when present."
         ),
     )
+    entities: list["ExtractedEntityPayload"] = Field(
+        ...,
+        max_length=12,
+        description=(
+            "Typed grounded entities from the chunk. Use exact or near-exact phrases "
+            "from the text and assign the closest supported entity type."
+        ),
+    )
+
+
+class ExtractedEntityPayload(SchemaBaseModel):
+    name: str = Field(
+        ...,
+        description="Exact or near-exact entity phrase copied from the chunk text.",
+    )
+    type: EntityType
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class DocumentSummaryPayload(SchemaBaseModel):
@@ -101,7 +118,10 @@ class StructuredExtractor:
                 self._build_tag_record(tag, source_chunk_id=chunk.chunk_id)
                 for tag in result.value.tags
             ],
-            entities=[],
+            entities=[
+                self._build_entity_record(entity, source_chunk_id=chunk.chunk_id)
+                for entity in result.value.entities
+            ],
             attempts=result.attempts,
             validator_notes=result.validator_notes,
         )
@@ -141,7 +161,12 @@ class StructuredExtractor:
         if not payload.summary.strip():
             raise ValueError("summary must not be blank")
 
-        return payload.model_copy(update={"tags": self._clean_tag_strings(payload.tags)})
+        return payload.model_copy(
+            update={
+                "tags": self._clean_tag_strings(payload.tags),
+                "entities": self._clean_entities(payload.entities),
+            }
+        )
 
     def _validate_document_summary_payload(
         self, payload: DocumentSummaryPayload
@@ -163,6 +188,20 @@ class StructuredExtractor:
             source_chunks=[source_chunk_id],
         )
 
+    def _build_entity_record(
+        self, entity: ExtractedEntityPayload, *, source_chunk_id: str
+    ) -> EntityRecord:
+        name = entity.name.strip()
+        normalized_name = normalize_entity_name(name)
+        return EntityRecord(
+            name=name,
+            normalized_name=normalized_name,
+            type=entity.type,
+            confidence=entity.confidence,
+            source="llm_extraction",
+            source_chunks=[source_chunk_id],
+        )
+
     def _clean_tag_strings(self, tags: Sequence[str]) -> list[str]:
         cleaned: list[str] = []
         seen: set[str] = set()
@@ -173,4 +212,21 @@ class StructuredExtractor:
                 continue
             seen.add(normalized)
             cleaned.append(name)
+        return cleaned
+
+    def _clean_entities(
+        self, entities: Sequence[ExtractedEntityPayload]
+    ) -> list[ExtractedEntityPayload]:
+        cleaned: list[ExtractedEntityPayload] = []
+        seen: set[tuple[EntityType, str]] = set()
+        for entity in entities:
+            name = entity.name.strip()
+            normalized = normalize_entity_name(name)
+            if not normalized:
+                continue
+            key = (entity.type, normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(entity.model_copy(update={"name": name}))
         return cleaned

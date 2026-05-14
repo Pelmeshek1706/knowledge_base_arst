@@ -107,8 +107,7 @@ Responsibility:
 
 - Generate chunk summaries.
 - Generate chunk tags.
-- Preserve chunk entities as an empty validated list until typed entity
-  extraction has separate model evidence.
+- Generate typed chunk entities.
 - Aggregate document-level summary/tags/entities.
 - Validate model output with Pydantic.
 - Retry on invalid JSON.

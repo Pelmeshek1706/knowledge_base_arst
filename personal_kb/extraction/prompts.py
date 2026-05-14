@@ -21,23 +21,36 @@ Extract retrieval-ready metadata from the chunk below.
 
 Rules:
 - Use only facts grounded in the provided chunk text.
-- Return exactly these schema fields: `summary` and `tags`.
+- Return exactly these schema fields: `summary`, `tags`, and `entities`.
 - Write `summary` as 1 to 3 sentences and keep it concise.
 - Return `tags` as short free-form strings useful for retrieval.
 - Include important names, organizations, projects, systems, tools, models,
   libraries, technologies, documents, concepts, and domain terms as tags.
+- Return `entities` as typed objects with `name`, `type`, and optional
+  `confidence`.
+- Entity `name` values must be exact or near-exact phrases from the chunk.
+- Entity `type` must be one of: Person, Organization, Project, Topic,
+  DocumentType, Date, MoneyAmount, Account, Invoice, Task, Technology,
+  UnknownEntity, LinkedEntity.
+- Extract entities for important people, organizations, projects, named
+  systems, technologies, document kinds, dates, tasks, and domain concepts.
 - If the chunk names its main subject, project, product, or system, include that
-  exact phrase as a tag.
+  exact phrase as both a tag and an entity when it cleanly fits a supported
+  entity type.
 - Prefer exact terms from the text, such as product names, model names, library
   names, database names, and project names.
 - Preserve central named project, system, tool, model, and technology phrases
   that appear in the text. Examples to preserve when present: Personal KB,
   LM Studio, Qwen, Neo4j, LangGraph, and structured JSON.
 - Do not return objects for tags. Each tag must be a string.
-- Do not return typed entities in this response. Entity extraction is separate.
+- Do not invent entities or tags. Omit unsupported items instead of guessing.
+- Keep entity lists focused. Prefer the most retrieval-useful grounded entities
+  over exhaustive low-value noun lists.
 - Do not invent tags. Omit unsupported tags instead of guessing.
 - For tag-rich technical text, return useful non-empty tags. Use an empty tag
   list only when the chunk genuinely contains no useful retrieval terms.
+- Use an empty entity list only when the chunk genuinely contains no clear
+  supported entities.
 - Return only valid JSON that satisfies the schema. Do not include markdown,
   code fences, thinking text, or `<think>` blocks.
 

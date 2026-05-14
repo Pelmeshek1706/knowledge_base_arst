@@ -535,7 +535,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-008`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Extraction, embeddings, and document-level aggregation
 - Roadmap Phase(s): Phase 6
 - Goal: Generate chunk summaries, tags, entities, embeddings, and aggregated

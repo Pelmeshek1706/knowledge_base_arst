@@ -24,13 +24,24 @@ metadata, chunk embeddings, and document-level aggregation.
 
 ## Chunk extraction output contract
 
-The live Qwen2.5-backed chunk extraction call returns a minimal validated
-payload:
+The live Qwen2.5-backed chunk extraction call returns a validated payload with
+summary, free-form retrieval tags, and typed entities:
 
 ```json
 {
   "summary": "Concise grounded summary.",
-  "tags": ["Budget Review", "Roadmap", "Neo4j"]
+  "tags": ["Budget Review", "Roadmap", "Neo4j"],
+  "entities": [
+    {
+      "name": "Budget Review",
+      "type": "Topic",
+      "confidence": 0.86
+    },
+    {
+      "name": "Neo4j",
+      "type": "Technology"
+    }
+  ]
 }
 ```
 
@@ -40,10 +51,14 @@ Rules enforced in code:
 - `summary` must not be blank;
 - tag strings are trimmed, normalized with lowercase + trim + collapse spaces,
   and deduplicated by normalized name before becoming `TagRecord` records;
+- entity objects must include `name` and `type`; `confidence` is optional;
+- entity names are trimmed, normalized with lowercase + trim + collapse spaces,
+  deduplicated by `(type, normalized_name)`, and converted into `EntityRecord`
+  objects with deterministic IDs/keys;
 - tag records use `source="llm_extraction"` and the current chunk ID in
   `source_chunks`;
-- chunk entities remain empty on this Qwen2.5 path until typed entity extraction
-  is validated separately;
+- entity records use `source="llm_extraction"` and the current chunk ID in
+  `source_chunks`;
 - extraction uses `thinking_mode="non_thinking"`;
 - reasoning-content fallback is allowed only when visible assistant content is
   empty, the reasoning text is valid JSON, and the parsed payload validates
@@ -107,7 +122,16 @@ Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron
           "source_chunks": ["doc-1-0"]
         }
       ],
-      "entities": [],
+      "entities": [
+        {
+          "name": "Alpha",
+          "normalized_name": "alpha",
+          "type": "Topic",
+          "confidence": 0.76,
+          "source": "llm_extraction",
+          "source_chunks": ["doc-1-0"]
+        }
+      ],
       "embedding": [1.0, 0.0, 0.0],
       "embedding_model": "test-embedding",
       "embedding_dimension": 3
