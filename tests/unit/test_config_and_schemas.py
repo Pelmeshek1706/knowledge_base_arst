@@ -148,10 +148,13 @@ def test_schema_payloads_validate_successfully() -> None:
     assert answer_response.confidence == 0.9
     assert app_config.project.name == "personal_kb"
     assert app_config.models.llm.default_thinking_mode == "non_thinking"
+    assert app_config.models.llm.allow_structured_output_reasoning_fallback is True
     assert (
         app_config.models.llm.model_name
         == "mlx-qwen3.5-9b-claude-4.6-opus-reasoning-distilled-v2"
     )
+    assert app_config.models.extraction.model_name == "qwen2.5-1.5b-instruct"
+    assert app_config.models.extraction.role == "extraction_default"
 
 
 def test_invalid_schema_payloads_fail_clearly() -> None:
@@ -220,7 +223,20 @@ lm_studio:
     monkeypatch.setenv("LOCAL_EMBED_DIMENSIONS", "256")
     monkeypatch.setenv("PERSONAL_KB_SEARCH_DEFAULT_TOP_K", "5")
     monkeypatch.setenv("PERSONAL_KB_MODEL_LLM_DEFAULT_THINKING_MODE", "thinking")
+    monkeypatch.setenv(
+        "PERSONAL_KB_MODEL_LLM_ALLOW_STRUCTURED_OUTPUT_REASONING_FALLBACK",
+        "false",
+    )
     monkeypatch.setenv("PERSONAL_KB_MODEL_LLM_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv(
+        "PERSONAL_KB_MODEL_EXTRACTION_MODEL_NAME",
+        "qwen2.5-1.5b-instruct",
+    )
+    monkeypatch.setenv(
+        "PERSONAL_KB_MODEL_EXTRACTION_BASE_URL",
+        "http://example:1234/v1",
+    )
+    monkeypatch.setenv("PERSONAL_KB_MODEL_EXTRACTION_TIMEOUT_SECONDS", "8.5")
 
     config = ConfigLoader(project_root=tmp_path).load()
 
@@ -230,6 +246,10 @@ lm_studio:
     assert config.models.llm.base_url == "http://example:1234/v1"
     assert config.models.llm.model_name == "test-model"
     assert config.models.llm.default_thinking_mode == "thinking"
+    assert config.models.llm.allow_structured_output_reasoning_fallback is False
     assert config.models.llm.timeout_seconds == 12.5
+    assert config.models.extraction.base_url == "http://example:1234/v1"
+    assert config.models.extraction.model_name == "qwen2.5-1.5b-instruct"
+    assert config.models.extraction.timeout_seconds == 8.5
     assert config.models.embedding.dimension == 256
     assert config.search.default_top_k == 5

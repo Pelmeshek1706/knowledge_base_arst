@@ -26,6 +26,19 @@ models:
     role: production_default
     default_thinking_mode: non_thinking
     structured_output_retries: 2
+    allow_structured_output_reasoning_fallback: true
+    timeout_seconds: 60.0
+  extraction:
+    provider: lmstudio_openai_compatible
+    base_url: http://localhost:1234/v1
+    api_key: lm-studio
+    model_name: qwen2.5-1.5b-instruct
+    runtime: mlx-lm
+    quantization: mixed_precision_4bit
+    role: extraction_default
+    default_thinking_mode: non_thinking
+    structured_output_retries: 2
+    allow_structured_output_reasoning_fallback: true
     timeout_seconds: 60.0
   embedding:
     provider: local

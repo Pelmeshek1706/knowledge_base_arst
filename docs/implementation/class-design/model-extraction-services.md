@@ -42,6 +42,9 @@ Responsibility:
 - Generate summaries.
 - Generate structured extraction JSON.
 - Generate final answers.
+- For compatible reasoning models, optionally accept structured JSON from
+  `reasoning_content` only when visible assistant content is empty and the
+  reasoning payload validates against the requested schema.
 
 ```python
 class LLMClient:
@@ -53,6 +56,12 @@ MVP model:
 
 ```text
 mlx-community/Qwen3.5-9B-OptiQ-4bit
+```
+
+Dedicated extraction model config:
+
+```text
+qwen2.5-1.5b-instruct
 ```
 
 #### `EmbeddingClient`
@@ -97,7 +106,9 @@ class RerankerClient:
 Responsibility:
 
 - Generate chunk summaries.
-- Generate chunk tags/entities.
+- Generate chunk tags.
+- Preserve chunk entities as an empty validated list until typed entity
+  extraction has separate model evidence.
 - Aggregate document-level summary/tags/entities.
 - Validate model output with Pydantic.
 - Retry on invalid JSON.
@@ -172,6 +183,9 @@ class DocumentMetadataAggregator:
 
 - LM Studio endpoint unavailable.
 - Model returns invalid JSON.
+- Reasoning models can return schema-valid JSON in `reasoning_content` with
+  empty visible content; this compatibility path must remain explicit,
+  schema-validated, and visible in response metadata/warnings.
 - Embedding model returns wrong dimension or non-normalized vectors.
 - Reranker scores are unavailable or incompatible with candidate order.
 - Extraction output may duplicate tags/entities unless normalized.

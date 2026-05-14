@@ -17,6 +17,7 @@ from personal_kb.schemas.common import SchemaBaseModel
 from personal_kb.schemas.config import LLMConfig, LLMThinkingMode
 
 LLMRole = Literal["system", "user", "assistant"]
+StructuredOutputSource = Literal["visible_content", "reasoning_content_fallback"]
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
@@ -40,6 +41,7 @@ class LLMResponseMetadata(SchemaBaseModel):
     thinking_mode_defaulted: bool = False
     reasoning_content_present: bool = False
     provider_honored_non_thinking_request: bool | None = None
+    structured_output_source: StructuredOutputSource | None = None
     retry_count: int = Field(default=0, ge=0)
     usage: LLMUsage = Field(default_factory=LLMUsage)
     warnings: list[str] = Field(default_factory=list)
@@ -120,35 +122,12 @@ class LLMClient:
         message = self._extract_message(raw_response)
         content = self._stringify_message_field(message.get("content"))
         reasoning_content = self._extract_reasoning_content(message, raw_response)
-        warnings: list[str] = []
-        honored: bool | None = None
-
-        if resolved_mode == "non_thinking" and reasoning_content:
-            honored = False
-            warnings.append(
-                "Provider returned reasoning content for a non-thinking request."
-            )
-        if not content and reasoning_content:
-            warnings.append(
-                "The provider returned reasoning content without visible assistant text. "
-                "Increase max_tokens if you need a final answer."
-            )
-
-        return LLMTextResponse(
+        return self._build_text_response(
             content=content,
             reasoning_content=reasoning_content,
-            metadata=LLMResponseMetadata(
-                provider=self.config.provider,
-                model_name=self.config.model_name,
-                finish_reason=self._extract_finish_reason(raw_response),
-                thinking_mode_requested=resolved_mode,
-                thinking_mode_defaulted=defaulted,
-                reasoning_content_present=reasoning_content is not None,
-                provider_honored_non_thinking_request=honored,
-                usage=self._extract_usage(raw_response),
-                warnings=warnings,
-                raw_provider_response=raw_response,
-            ),
+            raw_response=raw_response,
+            thinking_mode=resolved_mode,
+            defaulted=defaulted,
         )
 
     def generate_json(
@@ -186,40 +165,21 @@ class LLMClient:
             message = self._extract_message(raw_response)
             content = self._stringify_message_field(message.get("content"))
             reasoning_content = self._extract_reasoning_content(message, raw_response)
-            warnings: list[str] = []
-            honored: bool | None = None
-            if resolved_mode == "non_thinking" and reasoning_content:
-                honored = False
-                warnings.append(
-                    "Provider returned reasoning content for a non-thinking request."
-                )
-            if not content and reasoning_content:
-                warnings.append(
-                    "The provider returned reasoning content without visible assistant text. "
-                    "Increase max_tokens if you need a final answer."
-                )
-            parsed_response = LLMTextResponse(
+            parsed_response = self._build_text_response(
                 content=content,
                 reasoning_content=reasoning_content,
-                metadata=LLMResponseMetadata(
-                    provider=self.config.provider,
-                    model_name=self.config.model_name,
-                    finish_reason=self._extract_finish_reason(raw_response),
-                    thinking_mode_requested=resolved_mode,
-                    thinking_mode_defaulted=defaulted,
-                    reasoning_content_present=reasoning_content is not None,
-                    provider_honored_non_thinking_request=honored,
-                    retry_count=attempt_index,
-                    usage=self._extract_usage(raw_response),
-                    warnings=warnings,
-                    raw_provider_response=raw_response,
-                ),
+                raw_response=raw_response,
+                thinking_mode=resolved_mode,
+                defaulted=defaulted,
+                retry_count=attempt_index,
             )
 
             try:
-                payload = json.loads(content)
-                parsed_value = response_schema.model_validate(payload)
-            except (json.JSONDecodeError, ValidationError) as exc:
+                parsed_value = self._parse_structured_response(
+                    response_schema=response_schema,
+                    response=parsed_response,
+                )
+            except (StructuredOutputError, json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
                 if attempt_index + 1 >= total_attempts:
                     break
@@ -240,10 +200,12 @@ class LLMClient:
                 attempts=attempt_index + 1,
             )
 
-        raise StructuredOutputError(
+        final_error = StructuredOutputError(
             "structured output validation failed after "
             f"{total_attempts} attempts: {last_error}"
-        ) from last_error
+        )
+        self._copy_structured_output_diagnostics(final_error, last_error)
+        raise final_error from last_error
 
     def _get_client(self) -> OpenAICompatibleClient:
         if self._client is None:
@@ -361,6 +323,154 @@ class LLMClient:
             f"Previous response preview: {preview}\n"
             "Try again and return only valid JSON."
         )
+
+    def _parse_structured_response(
+        self,
+        *,
+        response_schema: type[SchemaT],
+        response: LLMTextResponse,
+    ) -> SchemaT:
+        content = response.content.strip()
+        if content:
+            parsed_payload = json.loads(content)
+            parsed_value = response_schema.model_validate(parsed_payload)
+            response.metadata.structured_output_source = "visible_content"
+            return parsed_value
+
+        if self.config.allow_structured_output_reasoning_fallback:
+            reasoning_content = (response.reasoning_content or "").strip()
+            if reasoning_content:
+                try:
+                    parsed_payload = json.loads(reasoning_content)
+                    parsed_value = response_schema.model_validate(parsed_payload)
+                except (json.JSONDecodeError, ValidationError):
+                    raise self._build_empty_structured_output_error(
+                        response_schema=response_schema,
+                        response=response,
+                    )
+
+                response.metadata.structured_output_source = (
+                    "reasoning_content_fallback"
+                )
+                response.metadata.warnings.append(
+                    "Accepted structured JSON from reasoning_content because visible "
+                    "assistant content was empty and the reasoning payload validated "
+                    f"against {response_schema.__name__}."
+                )
+                return parsed_value
+
+        raise self._build_empty_structured_output_error(
+            response_schema=response_schema,
+            response=response,
+        )
+
+    def _build_text_response(
+        self,
+        *,
+        content: str,
+        reasoning_content: str | None,
+        raw_response: dict[str, Any],
+        thinking_mode: LLMThinkingMode,
+        defaulted: bool,
+        retry_count: int = 0,
+    ) -> LLMTextResponse:
+        warnings: list[str] = []
+        honored: bool | None = None
+        if thinking_mode == "non_thinking" and reasoning_content:
+            honored = False
+            warnings.append(
+                "Provider returned reasoning content for a non-thinking request."
+            )
+        if not content and reasoning_content:
+            warnings.append(
+                "The provider returned reasoning content without visible assistant text. "
+                "Increase max_tokens if you need a final answer."
+            )
+
+        return LLMTextResponse(
+            content=content,
+            reasoning_content=reasoning_content,
+            metadata=LLMResponseMetadata(
+                provider=self.config.provider,
+                model_name=self.config.model_name,
+                finish_reason=self._extract_finish_reason(raw_response),
+                thinking_mode_requested=thinking_mode,
+                thinking_mode_defaulted=defaulted,
+                reasoning_content_present=reasoning_content is not None,
+                provider_honored_non_thinking_request=honored,
+                retry_count=retry_count,
+                usage=self._extract_usage(raw_response),
+                warnings=warnings,
+                raw_provider_response=raw_response,
+            ),
+        )
+
+    def _build_empty_structured_output_error(
+        self,
+        *,
+        response_schema: type[BaseModel],
+        response: LLMTextResponse,
+    ) -> StructuredOutputError:
+        if response.reasoning_content and response.reasoning_content.strip():
+            detail = "provider returned reasoning-only output without visible assistant JSON content"
+        else:
+            detail = "provider returned no visible assistant JSON content"
+        finish_reason = response.metadata.finish_reason or "unknown"
+        reason_preview = self._preview_text(response.reasoning_content)
+        message = (
+            f"{detail} for structured output schema {response_schema.__name__}; "
+            f"finish_reason={finish_reason}"
+        )
+        if reason_preview is not None:
+            message += f"; reasoning_preview={reason_preview!r}"
+        if response.metadata.warnings:
+            message += f"; warnings={response.metadata.warnings}"
+
+        error = StructuredOutputError(message)
+        self._attach_structured_output_diagnostics(
+            error,
+            response=response,
+            response_schema=response_schema,
+            failure_kind="empty_content",
+        )
+        return error
+
+    def _attach_structured_output_diagnostics(
+        self,
+        error: StructuredOutputError,
+        *,
+        response: LLMTextResponse,
+        response_schema: type[BaseModel],
+        failure_kind: str,
+    ) -> None:
+        error.response = response  # type: ignore[attr-defined]
+        error.response_metadata = response.metadata  # type: ignore[attr-defined]
+        error.raw_provider_response = response.metadata.raw_provider_response  # type: ignore[attr-defined]
+        error.response_schema = response_schema.__name__  # type: ignore[attr-defined]
+        error.failure_kind = failure_kind  # type: ignore[attr-defined]
+
+    def _copy_structured_output_diagnostics(
+        self, target: StructuredOutputError, source: Exception | None
+    ) -> None:
+        if source is None:
+            return
+        for attr_name in (
+            "response",
+            "response_metadata",
+            "raw_provider_response",
+            "response_schema",
+            "failure_kind",
+        ):
+            if hasattr(source, attr_name):
+                setattr(target, attr_name, getattr(source, attr_name))
+
+    def _preview_text(self, value: str | None, *, limit: int = 160) -> str | None:
+        if value is None:
+            return None
+        compact = " ".join(value.split())
+        if not compact:
+            return None
+        return compact[:limit]
 
     def _coerce_response_dict(self, response: Any) -> dict[str, Any]:
         if hasattr(response, "model_dump"):

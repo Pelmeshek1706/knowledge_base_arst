@@ -207,6 +207,154 @@ def test_generate_json_retries_invalid_structured_output() -> None:
     assert "Your previous response was invalid." in repaired_user_prompt
 
 
+def test_generate_json_retries_reasoning_only_structured_output() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="",
+                reasoning_content="I identified the fields but did not emit the JSON object.",
+            ),
+            _response_payload(content='{"answer": "fixed"}'),
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(structured_output_retries=1),
+        client_factory=lambda config: fake_client,
+    )
+
+    result = client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+    assert result.attempts == 2
+    assert result.value.answer == "fixed"
+    repaired_user_prompt = (
+        fake_client.chat.completions.requests[1]["messages"][-1]["content"]
+    )
+    assert "Previous response preview: <empty>" in repaired_user_prompt
+
+
+def test_generate_json_accepts_valid_reasoning_content_fallback() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="",
+                reasoning_content='{"answer": "from reasoning"}',
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(structured_output_retries=0),
+        client_factory=lambda config: fake_client,
+    )
+
+    result = client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+    assert result.value.answer == "from reasoning"
+    assert result.attempts == 1
+    assert result.response.content == ""
+    assert result.response.metadata.structured_output_source == (
+        "reasoning_content_fallback"
+    )
+    assert any(
+        "Accepted structured JSON from reasoning_content" in warning
+        for warning in result.response.metadata.warnings
+    )
+
+
+def test_generate_json_does_not_use_reasoning_fallback_when_visible_content_exists() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="not-json",
+                reasoning_content='{"answer": "valid but ignored"}',
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(structured_output_retries=0),
+        client_factory=lambda config: fake_client,
+    )
+
+    with pytest.raises(StructuredOutputError):
+        client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+
+def test_generate_json_raises_clear_error_for_empty_structured_content() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="",
+                reasoning_content="I can explain the answer but did not emit JSON.",
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(structured_output_retries=0),
+        client_factory=lambda config: fake_client,
+    )
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+    message = str(exc_info.value)
+    assert "structured output validation failed after 1 attempts" in message
+    assert "reasoning-only output without visible assistant JSON content" in message
+    assert "AnswerPayload" in message
+    assert "finish_reason=stop" in message
+    assert exc_info.value.failure_kind == "empty_content"  # type: ignore[attr-defined]
+    assert (
+        exc_info.value.response_metadata.raw_provider_response["choices"][0]["message"][
+            "reasoning_content"
+        ]
+        == "I can explain the answer but did not emit JSON."
+    )  # type: ignore[attr-defined]
+    assert (
+        exc_info.value.response_metadata.structured_output_source is None
+    )  # type: ignore[attr-defined]
+
+
+def test_generate_json_raises_for_invalid_reasoning_content_fallback() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="",
+                reasoning_content="not-json",
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(structured_output_retries=0),
+        client_factory=lambda config: fake_client,
+    )
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+    message = str(exc_info.value)
+    assert "reasoning-only output without visible assistant JSON content" in message
+    assert exc_info.value.failure_kind == "empty_content"  # type: ignore[attr-defined]
+
+
+def test_generate_json_can_disable_reasoning_content_fallback() -> None:
+    fake_client = FakeClient(
+        [
+            _response_payload(
+                content="",
+                reasoning_content='{"answer": "valid but disabled"}',
+            )
+        ]
+    )
+    client = LLMClient(
+        LLMConfig(
+            structured_output_retries=0,
+            allow_structured_output_reasoning_fallback=False,
+        ),
+        client_factory=lambda config: fake_client,
+    )
+
+    with pytest.raises(StructuredOutputError):
+        client.generate_json("Return JSON", response_schema=AnswerPayload)
+
+
 def test_generate_json_raises_after_retry_budget_is_exhausted() -> None:
     fake_client = FakeClient(
         [

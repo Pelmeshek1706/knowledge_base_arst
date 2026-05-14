@@ -474,7 +474,7 @@ Allowed task statuses:
 
 ### Task ID: `TL-007`
 
-- Status: `PENDING_USER_APPROVAL`
+- Status: `DONE`
 - Title: Local model client boundaries
 - Roadmap Phase(s): Phase 5
 - Goal: Implement mockable, lazy-loading LLM, embedding, reranker, and

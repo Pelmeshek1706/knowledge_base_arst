@@ -44,6 +44,7 @@ class LLMConfig(SchemaBaseModel):
     role: str = "production_default"
     default_thinking_mode: LLMThinkingMode = "non_thinking"
     structured_output_retries: int = Field(default=2, ge=0)
+    allow_structured_output_reasoning_fallback: bool = True
     timeout_seconds: float = Field(default=60.0, gt=0)
 
 
@@ -68,6 +69,12 @@ class RerankerConfig(SchemaBaseModel):
 
 class ModelConfig(SchemaBaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    extraction: LLMConfig = Field(
+        default_factory=lambda: LLMConfig(
+            model_name="qwen2.5-1.5b-instruct",
+            role="extraction_default",
+        )
+    )
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
 

@@ -3,7 +3,9 @@
 ## Purpose
 
 Generate chunk/document summaries, tags, entities, entity summaries, and
-vectors.
+vectors. The current TL-008 Qwen2.5 extraction fix validates the reliable
+summary/tag path first and leaves typed entities empty until a separate entity
+extraction evaluation.
 
 ## Status
 
@@ -73,7 +75,8 @@ Chunk text
 
 ## Exit criteria
 
-- Each chunk receives summary, tags, entities, and embedding.
+- Each chunk receives summary, tags, an entities field, and embedding. Typed
+  entities may be empty until entity extraction has separate model validation.
 - Document-level tags/entities are aggregated from chunks.
 - Entity/tag normalization uses lowercase + trim + collapse spaces.
 - Embeddings are stored both in JSON and Neo4j later.

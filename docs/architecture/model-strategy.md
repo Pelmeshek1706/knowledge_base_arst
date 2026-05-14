@@ -64,6 +64,25 @@ llm:
   runtime: mlx-lm
   quantization: mixed_precision_4bit
   role: production_default
+  allow_structured_output_reasoning_fallback: true
+```
+
+### Extraction LLM
+
+Chunk metadata extraction uses a dedicated LM Studio LLM configuration so the
+general answer-generation LLM can remain separate from the model that best
+follows strict extraction instructions.
+
+```yaml
+extraction:
+  provider: lmstudio_openai_compatible
+  base_url: http://localhost:1234/v1
+  model_name: qwen2.5-1.5b-instruct
+  runtime: mlx-lm
+  quantization: mixed_precision_4bit
+  role: extraction_default
+  default_thinking_mode: non_thinking
+  allow_structured_output_reasoning_fallback: true
 ```
 
 ### Embedding model
@@ -109,6 +128,21 @@ For each chunk:
 - summary
 - tags
 - entities
+
+The live TL-008 extraction path asks the LLM for a minimal schema:
+
+```json
+{
+  "summary": "Concise grounded summary.",
+  "tags": ["LM Studio", "LangGraph", "Neo4j"]
+}
+```
+
+The extraction service maps each validated tag string into a `TagRecord` by
+trimming the model text, normalizing with lowercase + trim + collapse spaces,
+deduplicating by normalized name, setting `source` to `llm_extraction`, and
+attaching the current chunk ID in `source_chunks`. Chunk entities remain empty
+on this path until typed entity extraction has separate model evidence.
 
 Entity structure:
 
@@ -218,6 +252,17 @@ models:
     runtime: mlx-lm
     quantization: mixed_precision_4bit
     role: production_default
+    allow_structured_output_reasoning_fallback: true
+
+  extraction:
+    provider: lmstudio_openai_compatible
+    base_url: http://localhost:1234/v1
+    model_name: qwen2.5-1.5b-instruct
+    runtime: mlx-lm
+    quantization: mixed_precision_4bit
+    role: extraction_default
+    default_thinking_mode: non_thinking
+    allow_structured_output_reasoning_fallback: true
 
   embedding:
     provider: local_transformers_or_sentence_transformers
@@ -334,7 +379,8 @@ Validate model strategy by checking that:
 - embeddings have dimension `1024`;
 - embeddings are normalized when configured;
 - full vectors are stored in JSON during MVP;
-- chunk extraction returns schema-valid summaries, tags, and entities;
+- chunk extraction returns schema-valid summaries and tags, with typed entities
+  added only after separate model validation;
 - normalization uses lowercase, trim, and collapse repeated spaces;
 - document-level fields aggregate from chunks;
 - semantic types remain tags, not `document_type`;

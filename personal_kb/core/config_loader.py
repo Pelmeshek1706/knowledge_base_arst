@@ -56,9 +56,49 @@ _PREFERRED_ENV_TO_PATHS: dict[str, tuple[str, ...]] = {
         "llm",
         "structured_output_retries",
     ),
+    "PERSONAL_KB_MODEL_LLM_ALLOW_STRUCTURED_OUTPUT_REASONING_FALLBACK": (
+        "models",
+        "llm",
+        "allow_structured_output_reasoning_fallback",
+    ),
     "PERSONAL_KB_MODEL_LLM_TIMEOUT_SECONDS": (
         "models",
         "llm",
+        "timeout_seconds",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_PROVIDER": ("models", "extraction", "provider"),
+    "PERSONAL_KB_MODEL_EXTRACTION_BASE_URL": ("models", "extraction", "base_url"),
+    "PERSONAL_KB_MODEL_EXTRACTION_API_KEY": ("models", "extraction", "api_key"),
+    "PERSONAL_KB_MODEL_EXTRACTION_MODEL_NAME": (
+        "models",
+        "extraction",
+        "model_name",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_RUNTIME": ("models", "extraction", "runtime"),
+    "PERSONAL_KB_MODEL_EXTRACTION_QUANTIZATION": (
+        "models",
+        "extraction",
+        "quantization",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_ROLE": ("models", "extraction", "role"),
+    "PERSONAL_KB_MODEL_EXTRACTION_DEFAULT_THINKING_MODE": (
+        "models",
+        "extraction",
+        "default_thinking_mode",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_STRUCTURED_OUTPUT_RETRIES": (
+        "models",
+        "extraction",
+        "structured_output_retries",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_ALLOW_STRUCTURED_OUTPUT_REASONING_FALLBACK": (
+        "models",
+        "extraction",
+        "allow_structured_output_reasoning_fallback",
+    ),
+    "PERSONAL_KB_MODEL_EXTRACTION_TIMEOUT_SECONDS": (
+        "models",
+        "extraction",
         "timeout_seconds",
     ),
     "PERSONAL_KB_MODEL_EMBEDDING_PROVIDER": ("models", "embedding", "provider"),
@@ -178,7 +218,18 @@ class ConfigLoader:
             "structured_output_retries": llm_source.get(
                 "structured_output_retries", 2
             ),
+            "allow_structured_output_reasoning_fallback": llm_source.get(
+                "allow_structured_output_reasoning_fallback", True
+            ),
             "timeout_seconds": llm_source.get("timeout_seconds", 60.0),
+        }
+
+        extraction_source = self._as_dict(models_source.get("extraction"))
+        extraction = {
+            **llm,
+            "model_name": "qwen2.5-1.5b-instruct",
+            "role": "extraction_default",
+            **extraction_source,
         }
 
         embedding_source = self._as_dict(models_source.get("embedding"))
@@ -230,6 +281,7 @@ class ConfigLoader:
             "neo4j": neo4j,
             "models": {
                 "llm": llm,
+                "extraction": extraction,
                 "embedding": embedding,
                 "reranker": reranker,
             },
